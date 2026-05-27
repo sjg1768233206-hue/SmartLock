@@ -1,0 +1,43 @@
+# Qt 编译产物
+*.o
+*.moc
+moc_*.cpp
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Qt 临时文件
+*.user
+*.user.*
+*.stash
+Makefile
+Makefile.*
+ui_*.h
+qrc_*.cpp
+
+# 编译目录
+build/
+*-Debug/
+*-Release/
+
+# 开发板数据（不包含在代码仓库）
+data/
+logs/
+*.db
+*.log
+
+# IDE 配置
+.vscode/
+.idea/
+.qtcreator/
+*.swp
+*~
+
+# 备份文件
+*.bak
+*.old
+
+# 交叉编译产物
+smartlock
+smartlock.exe
