@@ -337,13 +337,42 @@ void MainWindow::onCapturePhoto()
         return;
     }
 
-    // 保存临时照片
-    QDir().mkpath("data/temp");
-    m_tempFacePath = QString("data/temp/temp_%1.jpg").arg(QDateTime::currentMSecsSinceEpoch());
-    cv::imwrite(m_tempFacePath.toStdString(), face);
+    // 检查人脸尺寸
+    LOG_DEBUG(QString("Captured face size: %1x%2").arg(face.cols).arg(face.rows));
 
-    m_trainStatusLabel->setText("拍照成功！请输入姓名");
-    m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+    // 如果人脸太小，提示用户靠近摄像头
+    if (face.cols < 100 || face.rows < 100) {
+        QMessageBox::warning(this, "提示", "人脸太小，请靠近摄像头后重试");
+        return;
+    }
+
+
+    // 确保 temp 目录存在
+    QDir tempDir("/opt/smartlock/bin/data/temp");
+    if (!tempDir.exists()) {
+        if (!tempDir.mkpath(".")) {
+            LOG_ERROR("Failed to create temp directory");
+            QMessageBox::warning(this, "错误", "无法创建临时目录");
+            return;
+        }
+    }
+
+    // 保存临时照片
+    m_tempFacePath = QString("/opt/smartlock/bin/data/temp/temp_%1.jpg")
+                        .arg(QDateTime::currentMSecsSinceEpoch());
+
+    if (!cv::imwrite(m_tempFacePath.toStdString(), face)) {
+        LOG_ERROR("Failed to save temp image");
+        QMessageBox::warning(this, "错误", "照片保存失败");
+        return;
+    }
+
+    LOG_DEBUG(QString("Temp photo saved: %1").arg(m_tempFacePath));
+
+    if (m_trainStatusLabel) {
+        m_trainStatusLabel->setText("拍照成功！请输入姓名");
+        m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+    }
     m_trainNameEdit->setVisible(true);
     m_trainNameEdit->clear();
     m_trainNameEdit->setFocus();
@@ -353,23 +382,36 @@ void MainWindow::onCapturePhoto()
 
 void MainWindow::onConfirmEnroll()
 {
+    LOG_DEBUG("=== onConfirmEnroll: START ===");
+
     QString name = m_trainNameEdit->text().trimmed();
+    LOG_DEBUG(QString("Name: %1").arg(name));
+
     if (name.isEmpty()) {
         QMessageBox::warning(this, "提示", "请输入姓名");
         return;
     }
 
+    LOG_DEBUG(QString("Reading image from: %1").arg(m_tempFacePath));
     cv::Mat face = cv::imread(m_tempFacePath.toStdString());
     if (face.empty()) {
+        LOG_ERROR("Face image is empty!");
         QMessageBox::warning(this, "错误", "照片读取失败");
         onCancelEnroll();
         return;
     }
 
     // 保存到正式目录
-    QDir().mkpath(QString("data/train/%1").arg(name));
-    QString filename = QString("data/train/%1/001.jpg").arg(name);
-    cv::imwrite(filename.toStdString(), face);
+    QString trainDir = QString("/opt/smartlock/bin/data/train/%1").arg(name);
+    QDir().mkpath(trainDir);
+    QString filename = trainDir + "/001.jpg";
+
+    if (!cv::imwrite(filename.toStdString(), face)) {
+        LOG_ERROR("Failed to save face image");
+        QMessageBox::warning(this, "错误", "照片保存失败");
+        onCancelEnroll();
+        return;
+    }
 
     // 提取 NPU 特征
     cv::Mat grayFace;
@@ -387,31 +429,58 @@ void MainWindow::onConfirmEnroll()
         LOG_INFO(QString("Enrolled user: %1").arg(name));
         QMessageBox::information(this, "成功", QString("✅ %1 录入成功！").arg(name));
     } else {
+        LOG_ERROR("Feature extraction failed!");
         QMessageBox::warning(this, "失败", "特征提取失败，请重试");
     }
 
-    // 清理
-    QFile::remove(m_tempFacePath);
+    // 清理 - 先删除文件，再调用 onCancelEnroll
+    if (!m_tempFacePath.isEmpty() && QFile::exists(m_tempFacePath)) {
+        QFile::remove(m_tempFacePath);
+    }
+
+    // 注意：这里调用 onCancelEnroll 会再次尝试删除文件，所以先清空路径
+    QString tempPath = m_tempFacePath;
+    m_tempFacePath.clear();
     onCancelEnroll();
+
+    LOG_DEBUG("=== onConfirmEnroll: END ===");
 }
 
 void MainWindow::onCancelEnroll()
 {
-    m_trainStatusLabel->setText("就绪");
-    m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
-    m_trainNameEdit->setVisible(false);
-    m_trainNameEdit->clear();
-    m_btnConfirm->setVisible(false);
-    m_btnCancel->setVisible(false);
+    LOG_DEBUG("onCancelEnroll: START");
+
+    if (m_trainStatusLabel) {
+        m_trainStatusLabel->setText("就绪");
+        m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+    }
+
+    if (m_trainNameEdit) {
+        m_trainNameEdit->setVisible(false);
+        m_trainNameEdit->clear();
+    }
+
+    if (m_btnConfirm) {
+        m_btnConfirm->setVisible(false);
+    }
+
+    if (m_btnCancel) {
+        m_btnCancel->setVisible(false);
+    }
 
     if (!m_tempFacePath.isEmpty() && QFile::exists(m_tempFacePath)) {
-        QFile::remove(m_tempFacePath);
+        LOG_DEBUG(QString("Removing temp file: %1").arg(m_tempFacePath));
+        if (!QFile::remove(m_tempFacePath)) {
+            LOG_WARNING("Failed to remove temp file");
+        }
     }
+
+    LOG_DEBUG("onCancelEnroll: END");
 }
 
 void MainWindow::onShowPersonList()
 {
-    // 从 FeatureDatabase 获取人员列表（而不是文件系统）
+    // 从 FeatureDatabase 获取人员列表
     QStringList persons = FeatureDatabase::instance().getAllUserNames();
 
     if (persons.isEmpty()) {
@@ -454,26 +523,47 @@ void MainWindow::onShowPersonList()
             return;
         }
         QString name = item->text();
-        // 从 FeatureDatabase 获取照片路径（需要扩展数据库存储照片路径）
-        QString photoPath = QString("data/train/%1/001.jpg").arg(name);
+
+        // 使用绝对路径
+        QString photoPath = QString("/opt/smartlock/bin/data/train/%1/001.jpg").arg(name);
+
+        LOG_DEBUG(QString("Looking for photo: %1").arg(photoPath));
+
         if (!QFile::exists(photoPath)) {
-            QMessageBox::information(listDialog, "提示", "没有找到照片");
+            LOG_WARNING(QString("Photo not found: %1").arg(photoPath));
+            QMessageBox::information(listDialog, "提示", QString("没有找到 %1 的照片").arg(name));
             return;
         }
+
         QImage img(photoPath);
         if (!img.isNull()) {
             QDialog *photoDialog = new QDialog(listDialog);
             photoDialog->setWindowTitle(QString("%1 的照片").arg(name));
             photoDialog->setModal(true);
+            photoDialog->setFixedSize(350, 400);
+
             QVBoxLayout *photoLayout = new QVBoxLayout(photoDialog);
             QLabel *label = new QLabel();
-            label->setPixmap(QPixmap::fromImage(img).scaled(300, 300, Qt::KeepAspectRatio));
-            photoLayout->addWidget(label);
+
+            // 缩放图片以适应显示区域
+            QPixmap pixmap = QPixmap::fromImage(img);
+            QPixmap scaled = pixmap.scaled(300, 300, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            label->setPixmap(scaled);
+            label->setAlignment(Qt::AlignCenter);
+
             QPushButton *closePhotoBtn = new QPushButton("关闭");
-            photoLayout->addWidget(closePhotoBtn);
+            closePhotoBtn->setFixedSize(80, 30);
+
+            photoLayout->addWidget(label);
+            photoLayout->addWidget(closePhotoBtn, 0, Qt::AlignCenter);
+            photoLayout->setSpacing(15);
+
             connect(closePhotoBtn, &QPushButton::clicked, photoDialog, &QDialog::accept);
             photoDialog->exec();
             delete photoDialog;
+        } else {
+            LOG_ERROR(QString("Failed to load image: %1").arg(photoPath));
+            QMessageBox::warning(listDialog, "错误", "照片加载失败");
         }
     });
 
@@ -492,9 +582,13 @@ void MainWindow::onShowPersonList()
         );
         if (reply == QMessageBox::Yes) {
             // 删除照片文件
-            QDir dir(QString("data/train/%1").arg(name));
+            QDir dir(QString("/opt/smartlock/bin/data/train/%1").arg(name));
             if (dir.exists()) {
-                dir.removeRecursively();
+                if (dir.removeRecursively()) {
+                    LOG_INFO(QString("Deleted directory: %1").arg(dir.path()));
+                } else {
+                    LOG_WARNING(QString("Failed to delete directory: %1").arg(dir.path()));
+                }
             }
             // 从数据库删除特征
             FeatureDatabase::instance().removeUser(name);

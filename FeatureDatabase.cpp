@@ -57,7 +57,18 @@ QString FeatureDatabase::recognize(const std::vector<float>& features, float& be
         return QString();
     }
 
+    if (features.empty()) {
+        qDebug() << "Features is empty";
+        return QString();
+    }
+
     for (const auto& user : m_users) {
+        // 检查特征大小是否匹配
+        if (user.features.size() != features.size()) {
+            qDebug() << "Feature size mismatch:" << user.features.size() << "vs" << features.size();
+            continue;
+        }
+
         float dot = 0.0f;
         for (size_t i = 0; i < features.size(); i++) {
             dot += features[i] * user.features[i];
@@ -73,6 +84,7 @@ QString FeatureDatabase::recognize(const std::vector<float>& features, float& be
 
     qDebug() << "Best match:" << bestName << "score:" << bestScore << "threshold:" << m_threshold;
 
+    // 降低阈值，使用余弦相似度，范围是 -1 到 1，通常 0.5 以上算匹配
     if (bestScore < m_threshold) {
         return QString();
     }

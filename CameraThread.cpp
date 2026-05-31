@@ -151,13 +151,40 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
                     cv::Point(face.x, face.y - 10),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, textColor, 2);
 
-        // 保存人脸图像（用于注册）
-        if (face.width > 60 && face.height > 60) {
-            cv::Mat grayFace;
-            cv::cvtColor(frame(face), grayFace, cv::COLOR_RGB2GRAY);
-            {
-                QMutexLocker locker(&m_faceMutex);
-                m_currentFace = grayFace;
+        // ========== 保存人脸图像（用于注册）- 扩展区域 ==========
+        if (face.width > 50 && face.height > 50) {  // 降低阈值到 50x50
+            // 扩展人脸区域（扩大 40%，包含更多头部区域）
+            int expandX = face.width * 0.4;   // 水平扩展 40%
+            int expandY = face.height * 0.5;  // 垂直扩展 50%（多包含额头和下巴）
+
+            int x = std::max(0, face.x - expandX);
+            int y = std::max(0, face.y - expandY);
+            int w = std::min(frame.cols - x, face.width + expandX * 2);
+            int h = std::min(frame.rows - y, face.height + expandY * 2);
+
+            cv::Rect expandedFace(x, y, w, h);
+
+            // 确保区域有效
+            if (expandedFace.width > 0 && expandedFace.height > 0) {
+                cv::Mat grayFace;
+                cv::cvtColor(frame(expandedFace), grayFace, cv::COLOR_RGB2GRAY);
+                {
+                    QMutexLocker locker(&m_faceMutex);
+                    m_currentFace = grayFace;
+                }
+                LOG_DEBUG(QString("Saved face region: %1x%2 (expanded from %3x%4)")
+                          .arg(expandedFace.width).arg(expandedFace.height)
+                          .arg(face.width).arg(face.height));
+            } else {
+                // 如果扩展后无效，使用原始区域
+                cv::Mat grayFace;
+                cv::cvtColor(frame(face), grayFace, cv::COLOR_RGB2GRAY);
+                {
+                    QMutexLocker locker(&m_faceMutex);
+                    m_currentFace = grayFace;
+                }
+                LOG_DEBUG(QString("Saved original face region: %1x%2")
+                          .arg(face.width).arg(face.height));
             }
         }
 
@@ -180,9 +207,9 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
 
             QString fullPath = "/opt/smartlock/bin/" + photoPath;
             if (!frame.empty()) {
-                cv::Mat rgb;
-                cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
-                QImage qimg(rgb.data, rgb.cols, rgb.rows, rgb.step, QImage::Format_RGB888);
+                // frame 已经是 RGB 格式，不需要再转换
+                QImage qimg(frame.data, frame.cols, frame.rows,
+                            frame.step, QImage::Format_RGB888);
                 if (qimg.save(fullPath)) {
                     LOG_INFO(QString("Alert photo saved: %1").arg(fullPath));
                 } else {
@@ -201,7 +228,6 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
                     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
     }
 }
-
 void CameraThread::run()
 {
     LOG_INFO("CameraThread started");

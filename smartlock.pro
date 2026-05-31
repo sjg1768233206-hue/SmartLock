@@ -11,6 +11,7 @@ SOURCES += \
     FeatureDatabase.cpp \
     HttpServer.cpp \
     RC522Thread.cpp \
+    RetinaFaceEngine.cpp \
     WebSocketServer.cpp \
     databasemanager.cpp \
     gpu_video_widget.cpp \
@@ -27,6 +28,7 @@ HEADERS += \
     FeatureDatabase.h \
     HttpServer.h \
     RC522Thread.h \
+    RetinaFaceEngine.h \
     WebSocketServer.h \
     databasemanager.h \
     gpu_video_widget.h \
