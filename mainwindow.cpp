@@ -7,8 +7,11 @@
 #include "RC522Thread.h"
 #include "databasemanager.h"
 #include "logger.h"
+#include "gpu_video_widget.h"
+#include "FeatureDatabase.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGroupBox>
 #include <QPushButton>
 #include <QLabel>
 #include <QMessageBox>
@@ -16,13 +19,14 @@
 #include <QThread>
 #include <QDebug>
 #include <QDateTime>
-#include <QComboBox>
 #include <QDir>
 #include <QtConcurrent>
 #include <QFile>
 #include <QTextStream>
 #include <QTableView>
 #include <QHeaderView>
+#include <QListWidget>
+#include <QDialog>
 #include <opencv2/face.hpp>
 #include <fcntl.h>
 #include <linux/i2c-dev.h>
@@ -35,13 +39,13 @@
 #define I2C_DEVICE "/dev/i2c-5"
 #define AHT20_ADDR 0x38
 
-// 定义页面索引常量
-#define PAGE_FACE_RECOGNITION  0  // 人脸识别
-#define PAGE_PASSWORD_INPUT    1  // 输入密码
-#define PAGE_PASSWORD_CHANGE   2  // 修改密码
-#define PAGE_FACE_TRAIN        3  // 人脸训练
-#define PAGE_MANUAL_CONTROL    4  // 手动调试
-#define PAGE_ACCESS_LOG        5  // 开门记录
+// 页面索引
+#define PAGE_FACE_RECOGNITION  0
+#define PAGE_PASSWORD_INPUT    1
+#define PAGE_PASSWORD_CHANGE   2
+#define PAGE_FACE_TRAIN        3
+#define PAGE_MANUAL_CONTROL    4
+#define PAGE_ACCESS_LOG        5
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -58,52 +62,35 @@ MainWindow::MainWindow(QWidget *parent)
     , m_i2c_fd(-1)
     , m_tempTimer(nullptr)
     , m_trainNameEdit(nullptr)
-    , m_trainPersonList(nullptr)
-    , m_trainStartBtn(nullptr)
-    , m_trainModelBtn(nullptr)
-    , m_trainProgressLabel(nullptr)
     , m_trainStatusLabel(nullptr)
+    , m_btnConfirm(nullptr)
+    , m_btnCancel(nullptr)
     , m_logTableView(nullptr)
     , m_todayCountLabel(nullptr)
-    , m_captureCount(0)
-    , m_isCapturing(false)
+    , m_httpServer(nullptr)
 {
-    // 初始化日志系统
     Logger::instance().setLevel(Logger::DEBUG);
     Logger::instance().setConsoleOutput(true);
-    LOG_INFO("========================================");
-    LOG_INFO("SmartLock Application Starting");
-    LOG_INFO("========================================");
-
-    LOG_DEBUG("MainWindow constructor start");
+    LOG_INFO("SmartLock Starting");
 
     setupUI();
-    LOG_DEBUG("setupUI completed");
+    initDatabase();
+    initCamera();
+    initWebSocket();
+    initHttpServer();
+    initRC522();
+    initAHT20();
 
-    initDatabase();      // 初始化数据库
-    initCamera();        // 初始化摄像头
-    initWebSocket();     // 初始化 WebSocket
-    initHttpServer();    // 添加这行
-
-    initRC522();         // 初始化 RFID
-    initAHT20();         // 初始化温湿度传感器
-
-    // 默认显示人脸识别页面
     m_stackedWidget->setCurrentIndex(PAGE_FACE_RECOGNITION);
     m_passwordWidget->setMode(PasswordWidget::ModeInput);
 
     connect(&LockController::instance(), &LockController::lockStateChanged,
             this, &MainWindow::updateLockStatus);
-
     updateLockStatus(LockController::instance().isLocked());
-
-    LOG_INFO(QString("MainWindow constructor completed, current page: %1").arg(m_stackedWidget->currentIndex()));
 }
 
 MainWindow::~MainWindow()
 {
-    LOG_INFO("MainWindow destructor called");
-
     if (m_cameraThread) {
         m_cameraThread->stop();
         m_cameraThread->wait();
@@ -114,18 +101,9 @@ MainWindow::~MainWindow()
         m_rc522Thread->wait();
         delete m_rc522Thread;
     }
-    if (m_tempTimer) {
-        m_tempTimer->stop();
-        delete m_tempTimer;
-    }
-    if (m_i2c_fd >= 0) {
-        ::close(m_i2c_fd);
-    }
-
-    if (m_httpServer) {
-        delete m_httpServer;
-        m_httpServer = nullptr;
-    }
+    if (m_tempTimer) delete m_tempTimer;
+    if (m_i2c_fd >= 0) ::close(m_i2c_fd);
+    if (m_httpServer) delete m_httpServer;
     DatabaseManager::instance().close();
     delete ui;
 }
@@ -133,18 +111,17 @@ MainWindow::~MainWindow()
 void MainWindow::setupUI()
 {
     setWindowTitle("智能门锁");
-    setFixedSize(900, 550);
+    setFixedSize(950, 650);
 
     QWidget *centralWidget = new QWidget(this);
     QHBoxLayout *mainLayout = new QHBoxLayout(centralWidget);
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->setSpacing(0);
 
-    // ========== 左侧菜单栏 (200px) ==========
+    // ========== 左侧菜单 ==========
     QWidget *leftMenu = new QWidget(this);
     leftMenu->setFixedWidth(200);
     leftMenu->setStyleSheet("background-color: #2c3e50;");
-
     QVBoxLayout *menuLayout = new QVBoxLayout(leftMenu);
     menuLayout->setSpacing(15);
     menuLayout->setContentsMargins(0, 50, 0, 30);
@@ -154,253 +131,174 @@ void MainWindow::setupUI()
     titleLabel->setStyleSheet("color: white; font-size: 20px; font-weight: bold; padding-bottom: 20px;");
     menuLayout->addWidget(titleLabel);
 
-    // 菜单按钮
-    QPushButton *btnFaceRecognition = new QPushButton("👤 人脸识别", this);
-    QPushButton *btnPasswordInput = new QPushButton("🔐 输入密码", this);
-    QPushButton *btnChangePassword = new QPushButton("🔑 修改密码", this);
-    QPushButton *btnFaceTrain = new QPushButton("📸 人脸训练", this);
-    QPushButton *btnManualUnlock = new QPushButton("🔧 手动调试", this);
-    QPushButton *btnAccessLog = new QPushButton("📋 开门记录", this);
+    QString btnStyle = "QPushButton { background-color: #34495e; color: white; border: none; padding: 12px; border-radius: 8px; font-size: 14px; text-align: left; padding-left: 20px; }"
+                       "QPushButton:hover { background-color: #3d566e; }";
 
-    QString btnStyle = "QPushButton {"
-                       "background-color: #34495e;"
-                       "color: white;"
-                       "border: none;"
-                       "padding: 12px;"
-                       "border-radius: 8px;"
-                       "font-size: 14px;"
-                       "text-align: left;"
-                       "padding-left: 20px;"
-                       "}"
-                       "QPushButton:hover { background-color: #3d566e; }"
-                       "QPushButton:pressed { background-color: #1e2f3a; }";
+    QPushButton *btnFace = new QPushButton("👤 人脸识别", this);
+    QPushButton *btnPwd = new QPushButton("🔐 输入密码", this);
+    QPushButton *btnChangePwd = new QPushButton("🔑 修改密码", this);
+    QPushButton *btnTrain = new QPushButton("📸 人脸管理", this);
+    QPushButton *btnManual = new QPushButton("🔧 手动调试", this);
+    QPushButton *btnLog = new QPushButton("📋 开门记录", this);
 
-    btnFaceRecognition->setStyleSheet(btnStyle);
-    btnPasswordInput->setStyleSheet(btnStyle);
-    btnChangePassword->setStyleSheet(btnStyle);
-    btnFaceTrain->setStyleSheet(btnStyle);
-    btnManualUnlock->setStyleSheet(btnStyle);
-    btnAccessLog->setStyleSheet(btnStyle);
-
-    menuLayout->addWidget(btnFaceRecognition);
-    menuLayout->addWidget(btnPasswordInput);
-    menuLayout->addWidget(btnChangePassword);
-    menuLayout->addWidget(btnFaceTrain);
-    menuLayout->addWidget(btnManualUnlock);
-    menuLayout->addWidget(btnAccessLog);
+    for (auto btn : {btnFace, btnPwd, btnChangePwd, btnTrain, btnManual, btnLog}) {
+        btn->setStyleSheet(btnStyle);
+        menuLayout->addWidget(btn);
+    }
     menuLayout->addStretch();
 
-    // ========== 右侧内容区域 ==========
+    // ========== 右侧内容 ==========
     m_stackedWidget = new QStackedWidget(this);
     m_stackedWidget->setStyleSheet("background-color: #ecf0f1;");
 
-    // ---------- 页面0: 人脸识别页面 ----------
-    QWidget *faceRecognitionWidget = new QWidget(this);
-    QVBoxLayout *faceRecognitionLayout = new QVBoxLayout(faceRecognitionWidget);
-    faceRecognitionLayout->setContentsMargins(0, 0, 0, 0);
+    // --- 页面0: 人脸识别 ---
+    QWidget *faceWidget = new QWidget(this);
+    QVBoxLayout *faceLayout = new QVBoxLayout(faceWidget);
+    faceLayout->setContentsMargins(0, 0, 0, 0);
 
-    m_cameraLabel = new QLabel(this);
+    m_cameraLabel = new GPUVideoWidget(this);
     m_cameraLabel->setMinimumSize(640, 480);
-    m_cameraLabel->setAlignment(Qt::AlignCenter);
-    m_cameraLabel->setStyleSheet("background-color: #2c3e50; border-radius: 10px; color: white;");
-    m_cameraLabel->setText("摄像头启动中...");
-    faceRecognitionLayout->addWidget(m_cameraLabel);
+    m_cameraLabel->setStyleSheet("background-color: #2c3e50; border-radius: 10px;");
+    faceLayout->addWidget(m_cameraLabel);
 
-    m_stackedWidget->addWidget(faceRecognitionWidget);
+    QLabel *tipLabel = new QLabel("人脸识别中，请面对摄像头", this);
+    tipLabel->setAlignment(Qt::AlignCenter);
+    tipLabel->setStyleSheet("color: #7f8c8d; padding: 10px;");
+    faceLayout->addWidget(tipLabel);
 
-    // ---------- 页面1: 输入密码页面 ----------
-    PasswordWidget *inputPwdWidget = new PasswordWidget(this);
-    inputPwdWidget->setMode(PasswordWidget::ModeInput);
-    m_stackedWidget->addWidget(inputPwdWidget);
+    m_stackedWidget->addWidget(faceWidget);
 
-    // ---------- 页面2: 修改密码页面 ----------
-    PasswordWidget *changePwdWidget = new PasswordWidget(this);
-    changePwdWidget->setMode(PasswordWidget::ModeChange);
-    m_stackedWidget->addWidget(changePwdWidget);
+    // --- 页面1: 输入密码 ---
+    PasswordWidget *inputPwd = new PasswordWidget(this);
+    inputPwd->setMode(PasswordWidget::ModeInput);
+    m_stackedWidget->addWidget(inputPwd);
+    m_passwordWidget = inputPwd;
 
-    // 在创建 PasswordWidget 后添加
-    connect(inputPwdWidget, &PasswordWidget::passwordAlert, this, &MainWindow::onAlertTriggered);
+    // --- 页面2: 修改密码 ---
+    PasswordWidget *changePwd = new PasswordWidget(this);
+    changePwd->setMode(PasswordWidget::ModeChange);
+    m_stackedWidget->addWidget(changePwd);
 
-    // 保存指针供外部调用
-    m_passwordWidget = inputPwdWidget;
-
-    // ---------- 页面3: 人脸训练页面 ----------
+    // --- 页面3: 人脸管理 ---
     QWidget *trainWidget = new QWidget(this);
     QVBoxLayout *trainLayout = new QVBoxLayout(trainWidget);
-    trainLayout->setContentsMargins(0, 0, 0, 0);
-    trainLayout->setSpacing(10);
+    trainLayout->setContentsMargins(10, 10, 10, 10);
+    trainLayout->setSpacing(15);
 
-    m_trainCameraLabel = new QLabel(this);
-    m_trainCameraLabel->setMinimumSize(640, 350);
-    m_trainCameraLabel->setAlignment(Qt::AlignCenter);
-    m_trainCameraLabel->setStyleSheet("background-color: #2c3e50; border-radius: 10px; color: white;");
-    m_trainCameraLabel->setText("摄像头准备就绪");
+    // 摄像头预览
+    m_trainCameraLabel = new GPUVideoWidget(this);
+    m_trainCameraLabel->setMinimumSize(600, 420);
+    m_trainCameraLabel->setStyleSheet("background-color: #2c3e50; border-radius: 10px;");
     trainLayout->addWidget(m_trainCameraLabel);
 
-    // 训练控制面板
-    QHBoxLayout *trainControlLayout = new QHBoxLayout();
-    QLabel *nameLabel = new QLabel("姓名:", this);
+    // 录入区域（拍照后显示）
+    QHBoxLayout *enrollLayout = new QHBoxLayout();
+    enrollLayout->setSpacing(10);
+
     m_trainNameEdit = new QLineEdit(this);
-    m_trainNameEdit->setPlaceholderText("输入姓名，如：张三");
-    m_trainNameEdit->setFixedWidth(150);
+    m_trainNameEdit->setPlaceholderText("输入姓名");
+    m_trainNameEdit->setFixedWidth(200);
+    m_trainNameEdit->setVisible(false);
 
-    m_trainPersonList = new QComboBox(this);
-    m_trainPersonList->setFixedWidth(150);
-    m_trainPersonList->addItem("选择已有人员");
+    m_btnConfirm = new QPushButton("确认", this);
+    m_btnConfirm->setFixedSize(80, 35);
+    m_btnConfirm->setStyleSheet("background-color: #3498db; color: white; border-radius: 5px;");
+    m_btnConfirm->setVisible(false);
 
-    m_trainStartBtn = new QPushButton("📸 开始拍照", this);
-    m_trainStartBtn->setStyleSheet("background-color: #27ae60; color: white; padding: 8px; border-radius: 5px;");
+    m_btnCancel = new QPushButton("取消", this);
+    m_btnCancel->setFixedSize(80, 35);
+    m_btnCancel->setStyleSheet("background-color: #95a5a6; color: white; border-radius: 5px;");
+    m_btnCancel->setVisible(false);
 
-    m_trainProgressLabel = new QLabel("待拍照: 0/20", this);
-    m_trainProgressLabel->setStyleSheet("font-weight: bold;");
+    enrollLayout->addStretch();
+    enrollLayout->addWidget(m_trainNameEdit);
+    enrollLayout->addWidget(m_btnConfirm);
+    enrollLayout->addWidget(m_btnCancel);
+    enrollLayout->addStretch();
 
-    trainControlLayout->addWidget(nameLabel);
-    trainControlLayout->addWidget(m_trainNameEdit);
-    trainControlLayout->addWidget(m_trainPersonList);
-    trainControlLayout->addWidget(m_trainStartBtn);
-    trainControlLayout->addWidget(m_trainProgressLabel);
-    trainControlLayout->addStretch();
+    trainLayout->addLayout(enrollLayout);
 
-    trainLayout->addLayout(trainControlLayout);
+    // 两个大按钮
+    QHBoxLayout *btnLayout = new QHBoxLayout();
+    btnLayout->setSpacing(30);
 
-    // 训练状态和按钮
-    QHBoxLayout *trainActionLayout = new QHBoxLayout();
-    m_trainStatusLabel = new QLabel("就绪", this);
-    m_trainStatusLabel->setStyleSheet("color: #27ae60;");
+    QPushButton *captureBtn = new QPushButton("📷 拍照录入", this);
+    captureBtn->setFixedSize(180, 60);
+    captureBtn->setStyleSheet("background-color: #27ae60; color: white; font-size: 16px; border-radius: 10px;");
 
-    m_trainModelBtn = new QPushButton("🚀 训练模型", this);
-    m_trainModelBtn->setStyleSheet("background-color: #3498db; color: white; padding: 10px; border-radius: 5px;");
+    QPushButton *listBtn = new QPushButton("📋 已录入人员", this);
+    listBtn->setFixedSize(180, 60);
+    listBtn->setStyleSheet("background-color: #3498db; color: white; font-size: 16px; border-radius: 10px;");
 
-    trainActionLayout->addWidget(m_trainStatusLabel);
-    trainActionLayout->addStretch();
-    trainActionLayout->addWidget(m_trainModelBtn);
+    btnLayout->addStretch();
+    btnLayout->addWidget(captureBtn);
+    btnLayout->addWidget(listBtn);
+    btnLayout->addStretch();
 
-    trainLayout->addLayout(trainActionLayout);
-
-    QLabel *trainTipLabel = new QLabel("💡 提示：\n• 每人需要20张不同角度的照片\n• 请保持人脸在绿框内\n• 可以转头、变换表情", this);
-    trainTipLabel->setStyleSheet("color: #7f8c8d; font-size: 11px; background-color: #ecf0f1; padding: 10px; border-radius: 5px;");
-    trainTipLabel->setWordWrap(true);
-    trainLayout->addWidget(trainTipLabel);
+    trainLayout->addLayout(btnLayout);
+    trainLayout->addStretch();
 
     m_stackedWidget->addWidget(trainWidget);
 
-    // ---------- 页面4: 手动调试页面 ----------
-    QWidget *manualControlWidget = new QWidget(this);
-    QVBoxLayout *manualLayout = new QVBoxLayout(manualControlWidget);
+    // --- 页面4: 手动控制 ---
+    QWidget *manualWidget = new QWidget(this);
+    QVBoxLayout *manualLayout = new QVBoxLayout(manualWidget);
     manualLayout->setAlignment(Qt::AlignCenter);
-
     QLabel *manualTitle = new QLabel("🔧 手动控制", this);
     manualTitle->setAlignment(Qt::AlignCenter);
-    manualTitle->setStyleSheet("font-size: 24px; font-weight: bold; color: #2c3e50; margin-bottom: 30px;");
+    manualTitle->setStyleSheet("font-size: 24px; font-weight: bold;");
     manualLayout->addWidget(manualTitle);
 
-    QHBoxLayout *buttonLayout = new QHBoxLayout();
-    buttonLayout->setSpacing(20);
-
+    QHBoxLayout *btnLayout2 = new QHBoxLayout();
     QPushButton *btnUnlock = new QPushButton("🔓 解锁", this);
     QPushButton *btnLock = new QPushButton("🔒 锁定", this);
-    QPushButton *btnTest = new QPushButton("🔄 测试摆动", this);
+    QString bigStyle = "QPushButton { background-color: #3498db; color: white; padding: 20px; border-radius: 15px; font-size: 18px; min-width: 150px; }"
+                       "QPushButton:hover { background-color: #2980b9; }";
+    btnUnlock->setStyleSheet(bigStyle);
+    btnLock->setStyleSheet(bigStyle);
+    btnLayout2->addWidget(btnUnlock);
+    btnLayout2->addWidget(btnLock);
+    manualLayout->addLayout(btnLayout2);
+    m_stackedWidget->addWidget(manualWidget);
 
-    QString bigBtnStyle = "QPushButton {"
-                          "background-color: #3498db;"
-                          "color: white;"
-                          "border: none;"
-                          "padding: 20px;"
-                          "border-radius: 15px;"
-                          "font-size: 18px;"
-                          "font-weight: bold;"
-                          "min-width: 150px;"
-                          "}"
-                          "QPushButton:hover { background-color: #2980b9; }"
-                          "QPushButton:pressed { background-color: #1c6ea4; }";
-
-    btnUnlock->setStyleSheet(bigBtnStyle);
-    btnLock->setStyleSheet(bigBtnStyle);
-    btnTest->setStyleSheet(bigBtnStyle);
-
-    buttonLayout->addWidget(btnUnlock);
-    buttonLayout->addWidget(btnLock);
-    buttonLayout->addWidget(btnTest);
-    manualLayout->addLayout(buttonLayout);
-
-    QLabel *infoLabel = new QLabel("提示：解锁（90°）| 锁定（0°）| 测试（0°→90°→180°循环）", this);
-    infoLabel->setAlignment(Qt::AlignCenter);
-    infoLabel->setStyleSheet("color: #7f8c8d; margin-top: 30px;");
-    manualLayout->addWidget(infoLabel);
-
-    m_stackedWidget->addWidget(manualControlWidget);
-
-    // ---------- 页面5: 开门记录页面 ----------
+    // --- 页面5: 开门记录 ---
     QWidget *logWidget = new QWidget(this);
     QVBoxLayout *logLayout = new QVBoxLayout(logWidget);
-    logLayout->setContentsMargins(10, 10, 10, 10);
-
-    // 标题栏
     QHBoxLayout *logTitleLayout = new QHBoxLayout();
-    QLabel *logTitleLabel = new QLabel("📋 开门记录", this);
-    logTitleLabel->setStyleSheet("font-size: 20px; font-weight: bold; color: #2c3e50;");
-
+    QLabel *logTitle = new QLabel("📋 开门记录", this);
+    logTitle->setStyleSheet("font-size: 20px; font-weight: bold;");
     QPushButton *btnRefresh = new QPushButton("🔄 刷新", this);
-    btnRefresh->setFixedWidth(100);
-    btnRefresh->setStyleSheet("background-color: #3498db; color: white; padding: 5px; border-radius: 5px;");
-
     QPushButton *btnToday = new QPushButton("📅 今日", this);
-    btnToday->setFixedWidth(100);
-    btnToday->setStyleSheet("background-color: #27ae60; color: white; padding: 5px; border-radius: 5px;");
-
-    logTitleLayout->addWidget(logTitleLabel);
+    logTitleLayout->addWidget(logTitle);
     logTitleLayout->addStretch();
     logTitleLayout->addWidget(btnRefresh);
     logTitleLayout->addWidget(btnToday);
     logLayout->addLayout(logTitleLayout);
 
-    // 统计信息栏
-    QHBoxLayout *statsLayout = new QHBoxLayout();
     m_todayCountLabel = new QLabel("今日开门: 0次", this);
-    m_todayCountLabel->setStyleSheet("background-color: #27ae60; color: white; padding: 5px 15px; border-radius: 10px; font-weight: bold;");
-    statsLayout->addWidget(m_todayCountLabel);
-    statsLayout->addStretch();
-    logLayout->addLayout(statsLayout);
+    m_todayCountLabel->setStyleSheet("background-color: #27ae60; color: white; padding: 5px 15px; border-radius: 10px;");
+    logLayout->addWidget(m_todayCountLabel);
 
-    // 表格显示日志
     m_logTableView = new QTableView(this);
     m_logTableView->setAlternatingRowColors(true);
-    m_logTableView->setStyleSheet("QTableView::item { padding: 8px; }"
-                                  "QHeaderView::section { background-color: #34495e; color: white; padding: 5px; }");
-    m_logTableView->horizontalHeader()->setStretchLastSection(true);
     logLayout->addWidget(m_logTableView);
-
     m_stackedWidget->addWidget(logWidget);
 
-    // ========== 右上角状态栏 ==========
+    // ========== 顶部状态栏 ==========
     QWidget *titleBar = new QWidget(this);
     QHBoxLayout *titleBarLayout = new QHBoxLayout(titleBar);
-    titleBarLayout->setSpacing(20);
-
     m_tempLabel = new QLabel("🌡️ --.- °C", this);
-    m_tempLabel->setAlignment(Qt::AlignCenter);
-    m_tempLabel->setStyleSheet("color: #2c3e50; font-size: 14px; font-weight: bold; padding: 5px 10px; background-color: #ecf0f1; border-radius: 8px;");
-
     m_humiLabel = new QLabel("💧 --.- %", this);
-    m_humiLabel->setAlignment(Qt::AlignCenter);
-    m_humiLabel->setStyleSheet("color: #2c3e50; font-size: 14px; font-weight: bold; padding: 5px 10px; background-color: #ecf0f1; border-radius: 8px;");
-
     m_lockStatusLabel = new QLabel("🔒 已锁定", this);
-    m_lockStatusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    m_lockStatusLabel->setStyleSheet("color: #e74c3c; font-size: 14px; font-weight: bold; padding: 10px;");
-
+    m_lockStatusLabel->setAlignment(Qt::AlignRight);
     titleBarLayout->addWidget(m_tempLabel);
     titleBarLayout->addWidget(m_humiLabel);
     titleBarLayout->addStretch();
     titleBarLayout->addWidget(m_lockStatusLabel);
-    titleBarLayout->setContentsMargins(10, 5, 10, 0);
 
     QVBoxLayout *rightLayout = new QVBoxLayout();
     rightLayout->addWidget(titleBar);
     rightLayout->addWidget(m_stackedWidget, 1);
-    rightLayout->setContentsMargins(0, 0, 0, 0);
-    rightLayout->setSpacing(0);
-
     QWidget *rightWidget = new QWidget(this);
     rightWidget->setLayout(rightLayout);
 
@@ -408,74 +306,230 @@ void MainWindow::setupUI()
     mainLayout->addWidget(rightWidget, 1);
     setCentralWidget(centralWidget);
 
-    // ========== 连接信号 ==========
-    connect(btnFaceRecognition, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_FACE_RECOGNITION);
-        LOG_DEBUG("Switch to page 0: Face Recognition");
-    });
-
-    connect(btnPasswordInput, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_PASSWORD_INPUT);
-        LOG_DEBUG("Switch to page 1: Password Input");
-    });
-
-    connect(btnChangePassword, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_PASSWORD_CHANGE);
-        LOG_DEBUG("Switch to page 2: Password Change");
-    });
-
-    connect(btnFaceTrain, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_FACE_TRAIN);
-        loadPersonList();
-        LOG_DEBUG("Switch to page 3: Face Train");
-    });
-
-    connect(btnManualUnlock, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_MANUAL_CONTROL);
-        LOG_DEBUG("Switch to page 4: Manual Control");
-    });
-
-    connect(btnAccessLog, &QPushButton::clicked, [this]() {
-        m_stackedWidget->setCurrentIndex(PAGE_ACCESS_LOG);
-        refreshLogTable();
-        LOG_DEBUG("Switch to page 5: Access Log");
-    });
-
-    connect(btnRefresh, &QPushButton::clicked, [this]() {
-        refreshLogTable();
-    });
-
-    connect(btnToday, &QPushButton::clicked, [this]() {
-        refreshTodayLogTable();
-    });
-
+    // 连接信号
+    connect(btnFace, &QPushButton::clicked, this, &MainWindow::onFaceRecognitionClicked);
+    connect(btnPwd, &QPushButton::clicked, this, &MainWindow::onPasswordInputClicked);
+    connect(btnChangePwd, &QPushButton::clicked, this, &MainWindow::onChangePasswordClicked);
+    connect(btnTrain, &QPushButton::clicked, this, &MainWindow::onFaceTrainClicked);
+    connect(btnManual, &QPushButton::clicked, this, &MainWindow::onManualUnlockClicked);
+    connect(btnLog, &QPushButton::clicked, this, &MainWindow::onAccessLogClicked);
+    connect(btnRefresh, &QPushButton::clicked, this, &MainWindow::refreshLogTable);
+    connect(btnToday, &QPushButton::clicked, this, &MainWindow::refreshTodayLogTable);
     connect(btnUnlock, &QPushButton::clicked, [this]() {
         DatabaseManager::instance().addLog("手动", "手动", true);
         LockController::instance().unlock();
-        QMessageBox::information(this, "提示", "正在解锁...");
     });
-
     connect(btnLock, &QPushButton::clicked, [this]() {
         LockController::instance().lock();
-        QMessageBox::information(this, "提示", "正在锁定...");
+    });
+    connect(captureBtn, &QPushButton::clicked, this, &MainWindow::onCapturePhoto);
+    connect(listBtn, &QPushButton::clicked, this, &MainWindow::onShowPersonList);
+    connect(m_btnConfirm, &QPushButton::clicked, this, &MainWindow::onConfirmEnroll);
+    connect(m_btnCancel, &QPushButton::clicked, this, &MainWindow::onCancelEnroll);
+    connect(inputPwd, &PasswordWidget::passwordAlert, this, &MainWindow::onAlertTriggered);
+}
+
+void MainWindow::onCapturePhoto()
+{
+    cv::Mat face = m_cameraThread->getCurrentFace();
+    if (face.empty()) {
+        QMessageBox::warning(this, "提示", "未检测到人脸，请面对摄像头");
+        return;
+    }
+
+    // 保存临时照片
+    QDir().mkpath("data/temp");
+    m_tempFacePath = QString("data/temp/temp_%1.jpg").arg(QDateTime::currentMSecsSinceEpoch());
+    cv::imwrite(m_tempFacePath.toStdString(), face);
+
+    m_trainStatusLabel->setText("拍照成功！请输入姓名");
+    m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+    m_trainNameEdit->setVisible(true);
+    m_trainNameEdit->clear();
+    m_trainNameEdit->setFocus();
+    m_btnConfirm->setVisible(true);
+    m_btnCancel->setVisible(true);
+}
+
+void MainWindow::onConfirmEnroll()
+{
+    QString name = m_trainNameEdit->text().trimmed();
+    if (name.isEmpty()) {
+        QMessageBox::warning(this, "提示", "请输入姓名");
+        return;
+    }
+
+    cv::Mat face = cv::imread(m_tempFacePath.toStdString());
+    if (face.empty()) {
+        QMessageBox::warning(this, "错误", "照片读取失败");
+        onCancelEnroll();
+        return;
+    }
+
+    // 保存到正式目录
+    QDir().mkpath(QString("data/train/%1").arg(name));
+    QString filename = QString("data/train/%1/001.jpg").arg(name);
+    cv::imwrite(filename.toStdString(), face);
+
+    // 提取 NPU 特征
+    cv::Mat grayFace;
+    if (face.channels() == 3) {
+        cv::cvtColor(face, grayFace, cv::COLOR_BGR2GRAY);
+    } else {
+        grayFace = face;
+    }
+
+    std::vector<float> features = m_cameraThread->extractFeatureForEnroll(grayFace);
+
+    if (!features.empty()) {
+        FeatureDatabase::instance().addUser(name, features);
+        FeatureDatabase::instance().save("/opt/smartlock/bin/data/features.db");
+        LOG_INFO(QString("Enrolled user: %1").arg(name));
+        QMessageBox::information(this, "成功", QString("✅ %1 录入成功！").arg(name));
+    } else {
+        QMessageBox::warning(this, "失败", "特征提取失败，请重试");
+    }
+
+    // 清理
+    QFile::remove(m_tempFacePath);
+    onCancelEnroll();
+}
+
+void MainWindow::onCancelEnroll()
+{
+    m_trainStatusLabel->setText("就绪");
+    m_trainStatusLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+    m_trainNameEdit->setVisible(false);
+    m_trainNameEdit->clear();
+    m_btnConfirm->setVisible(false);
+    m_btnCancel->setVisible(false);
+
+    if (!m_tempFacePath.isEmpty() && QFile::exists(m_tempFacePath)) {
+        QFile::remove(m_tempFacePath);
+    }
+}
+
+void MainWindow::onShowPersonList()
+{
+    // 从 FeatureDatabase 获取人员列表（而不是文件系统）
+    QStringList persons = FeatureDatabase::instance().getAllUserNames();
+
+    if (persons.isEmpty()) {
+        QMessageBox::information(this, "提示", "暂无已录入人员");
+        return;
+    }
+
+    // 创建人员列表对话框
+    QDialog *listDialog = new QDialog(this);
+    listDialog->setWindowTitle("已录入人员");
+    listDialog->setModal(true);
+    listDialog->setFixedSize(350, 450);
+
+    QVBoxLayout *layout = new QVBoxLayout(listDialog);
+
+    QListWidget *listWidget = new QListWidget(listDialog);
+    for (const QString &person : persons) {
+        listWidget->addItem(person);
+    }
+
+    QHBoxLayout *btnLayout = new QHBoxLayout();
+    QPushButton *viewBtn = new QPushButton("查看照片", listDialog);
+    QPushButton *deleteBtn = new QPushButton("删除", listDialog);
+    deleteBtn->setStyleSheet("background-color: #e74c3c; color: white;");
+    QPushButton *closeBtn = new QPushButton("关闭", listDialog);
+
+    btnLayout->addWidget(viewBtn);
+    btnLayout->addWidget(deleteBtn);
+    btnLayout->addWidget(closeBtn);
+    btnLayout->addStretch();
+
+    layout->addWidget(listWidget);
+    layout->addLayout(btnLayout);
+
+    // 查看照片
+    connect(viewBtn, &QPushButton::clicked, [this, listWidget, listDialog]() {
+        QListWidgetItem *item = listWidget->currentItem();
+        if (!item) {
+            QMessageBox::warning(listDialog, "提示", "请先选择要查看的人员");
+            return;
+        }
+        QString name = item->text();
+        // 从 FeatureDatabase 获取照片路径（需要扩展数据库存储照片路径）
+        QString photoPath = QString("data/train/%1/001.jpg").arg(name);
+        if (!QFile::exists(photoPath)) {
+            QMessageBox::information(listDialog, "提示", "没有找到照片");
+            return;
+        }
+        QImage img(photoPath);
+        if (!img.isNull()) {
+            QDialog *photoDialog = new QDialog(listDialog);
+            photoDialog->setWindowTitle(QString("%1 的照片").arg(name));
+            photoDialog->setModal(true);
+            QVBoxLayout *photoLayout = new QVBoxLayout(photoDialog);
+            QLabel *label = new QLabel();
+            label->setPixmap(QPixmap::fromImage(img).scaled(300, 300, Qt::KeepAspectRatio));
+            photoLayout->addWidget(label);
+            QPushButton *closePhotoBtn = new QPushButton("关闭");
+            photoLayout->addWidget(closePhotoBtn);
+            connect(closePhotoBtn, &QPushButton::clicked, photoDialog, &QDialog::accept);
+            photoDialog->exec();
+            delete photoDialog;
+        }
     });
 
-    connect(btnTest, &QPushButton::clicked, [this]() {
-        QMessageBox::information(this, "提示", "开始测试，舵机将循环摆动");
-        QTimer::singleShot(100, []() {
-            LockController::instance().setServoAngle(0);
-            QThread::msleep(500);
-            LockController::instance().setServoAngle(90);
-            QThread::msleep(500);
-            LockController::instance().setServoAngle(180);
-            QThread::msleep(500);
-            LockController::instance().setServoAngle(90);
-        });
+    // 删除人员
+    connect(deleteBtn, &QPushButton::clicked, [this, listWidget, listDialog]() {
+        QListWidgetItem *item = listWidget->currentItem();
+        if (!item) {
+            QMessageBox::warning(listDialog, "提示", "请先选择要删除的人员");
+            return;
+        }
+        QString name = item->text();
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            listDialog, "确认删除",
+            QString("确定要删除「%1」的人脸数据吗？").arg(name),
+            QMessageBox::Yes | QMessageBox::No
+        );
+        if (reply == QMessageBox::Yes) {
+            // 删除照片文件
+            QDir dir(QString("data/train/%1").arg(name));
+            if (dir.exists()) {
+                dir.removeRecursively();
+            }
+            // 从数据库删除特征
+            FeatureDatabase::instance().removeUser(name);
+            FeatureDatabase::instance().save("/opt/smartlock/bin/data/features.db");
+
+            listWidget->takeItem(listWidget->row(item));
+            QMessageBox::information(listDialog, "成功", QString("已删除 %1").arg(name));
+        }
     });
 
-    // 训练按钮连接
-    connect(m_trainStartBtn, &QPushButton::clicked, this, &MainWindow::onStartCapture);
-    connect(m_trainModelBtn, &QPushButton::clicked, this, &MainWindow::onTrainModel);
+    connect(closeBtn, &QPushButton::clicked, listDialog, &QDialog::accept);
+    listDialog->exec();
+    delete listDialog;
+}
+
+void MainWindow::initCamera()
+{
+    m_cameraThread = new CameraThread(this);
+    connect(m_cameraThread, &CameraThread::frameReady, this, &MainWindow::onFrameReady);
+    connect(m_cameraThread, &CameraThread::error, this, &MainWindow::onCameraError);
+    connect(m_cameraThread, &CameraThread::faceDetected, this, &MainWindow::onFaceDetected);
+    connect(m_cameraThread, &CameraThread::faceRecognized, this, &MainWindow::onFaceRecognized);
+    connect(m_cameraThread, &CameraThread::unknownFaceAlert, this, &MainWindow::onAlertTriggered);
+    m_cameraThread->start();
+}
+
+void MainWindow::onFrameReady(const QImage &image)
+{
+    int currentPage = m_stackedWidget->currentIndex();
+
+    if (currentPage == PAGE_FACE_RECOGNITION && m_cameraLabel) {
+        m_cameraLabel->updateFrame(image);
+    } else if (currentPage == PAGE_FACE_TRAIN && m_trainCameraLabel) {
+        m_trainCameraLabel->updateFrame(image);
+    }
 }
 
 void MainWindow::initHttpServer()
@@ -542,215 +596,6 @@ void MainWindow::refreshTodayLogTable()
     }
 }
 
-void MainWindow::onFrameReady(const QImage &image)
-{
-    QPixmap pixmap = QPixmap::fromImage(image);
-    QPixmap scaled = pixmap.scaled(640, 480, Qt::KeepAspectRatio, Qt::FastTransformation);
-
-    int currentPage = m_stackedWidget->currentIndex();
-
-    if (currentPage == PAGE_FACE_RECOGNITION) {
-        if (m_cameraLabel) {
-            m_cameraLabel->setPixmap(scaled);
-        }
-    } else if (currentPage == PAGE_FACE_TRAIN) {
-        if (m_trainCameraLabel) {
-            m_trainCameraLabel->setPixmap(scaled);
-        }
-    }
-}
-
-void MainWindow::loadPersonList()
-{
-    m_trainPersonList->clear();
-    m_trainPersonList->addItem("选择已有人员");
-
-    QDir trainDir("data/train");
-    if (!trainDir.exists()) {
-        trainDir.mkpath(".");
-        return;
-    }
-
-    QStringList persons = trainDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    for (const QString &person : persons) {
-        QDir personDir(QString("data/train/%1").arg(person));
-        int photoCount = personDir.entryList(QStringList() << "*.jpg", QDir::Files).size();
-        m_trainPersonList->addItem(QString("%1 (%2张)").arg(person).arg(photoCount));
-    }
-}
-
-void MainWindow::onStartCapture()
-{
-    QString personName = m_trainNameEdit->text().trimmed();
-
-    if (!personName.isEmpty()) {
-        m_currentPerson = personName;
-    } else if (m_trainPersonList->currentIndex() > 0) {
-        QString text = m_trainPersonList->currentText();
-        m_currentPerson = text.split(" (").first();
-    } else {
-        QMessageBox::warning(this, "提示", "请选择人员或输入新名字");
-        return;
-    }
-
-    m_captureCount = 0;
-    m_isCapturing = true;
-
-    QDir dir;
-    dir.mkpath(QString("data/train/%1").arg(m_currentPerson));
-
-    m_trainStatusLabel->setText(QString("正在为 【%1】 拍照...").arg(m_currentPerson));
-    m_trainStatusLabel->setStyleSheet("color: #e74c3c;");
-    m_trainStartBtn->setEnabled(false);
-    m_trainModelBtn->setEnabled(false);
-    m_trainNameEdit->setEnabled(false);
-    m_trainPersonList->setEnabled(false);
-    m_trainProgressLabel->setText("准备拍照...");
-
-    QTimer::singleShot(1000, this, &MainWindow::onSaveFace);
-}
-
-void MainWindow::onSaveFace()
-{
-    if (!m_isCapturing) return;
-
-    if (m_captureCount >= 20) {
-        m_isCapturing = false;
-        m_trainStatusLabel->setText(QString("✅ %1 拍照完成！共 %2 张照片").arg(m_currentPerson).arg(m_captureCount));
-        m_trainStatusLabel->setStyleSheet("color: #27ae60;");
-        m_trainStartBtn->setEnabled(true);
-        m_trainModelBtn->setEnabled(true);
-        m_trainNameEdit->setEnabled(true);
-        m_trainPersonList->setEnabled(true);
-        loadPersonList();
-        m_trainProgressLabel->setText("拍照完成！");
-        return;
-    }
-
-    cv::Mat face = m_cameraThread->getCurrentFace();
-    if (face.empty()) {
-        m_trainProgressLabel->setText(QString("未检测到人脸... (%1/20)").arg(m_captureCount));
-        QTimer::singleShot(500, this, &MainWindow::onSaveFace);
-        return;
-    }
-
-    QString filename = QString("data/train/%1/%2.jpg")
-                           .arg(m_currentPerson)
-                           .arg(m_captureCount + 1, 3, 10, QChar('0'));
-
-    cv::Mat faceResized;
-    cv::resize(face, faceResized, cv::Size(100, 100));
-    cv::imwrite(filename.toStdString(), faceResized);
-
-    m_captureCount++;
-    m_trainProgressLabel->setText(QString("已拍照 %1/20").arg(m_captureCount));
-
-    QTimer::singleShot(500, this, &MainWindow::onSaveFace);
-}
-
-void MainWindow::onTrainModel()
-{
-    m_trainStatusLabel->setText("正在训练模型，请稍候...");
-    m_trainStatusLabel->setStyleSheet("color: #f39c12;");
-    m_trainModelBtn->setEnabled(false);
-    m_trainStartBtn->setEnabled(false);
-
-    QtConcurrent::run([this]() {
-        try {
-            std::vector<cv::Mat> images;
-            std::vector<int> labels;
-            std::map<int, QString> labelToName;
-
-            QDir trainDir("data/train");
-            QStringList persons = trainDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-
-            if (persons.isEmpty()) {
-                QMetaObject::invokeMethod(this, [this]() {
-                    QMessageBox::warning(this, "错误", "没有找到训练图片！请先拍照。");
-                    m_trainModelBtn->setEnabled(true);
-                    m_trainStartBtn->setEnabled(true);
-                    m_trainStatusLabel->setText("训练失败");
-                });
-                return;
-            }
-
-            int labelId = 0;
-            for (const QString &person : persons) {
-                QDir personDir(QString("data/train/%1").arg(person));
-                QStringList imageFiles = personDir.entryList(QStringList() << "*.jpg", QDir::Files);
-
-                for (const QString &imageFile : imageFiles) {
-                    QString fullPath = QString("data/train/%1/%2").arg(person).arg(imageFile);
-                    cv::Mat img = cv::imread(fullPath.toStdString(), cv::IMREAD_GRAYSCALE);
-                    if (!img.empty()) {
-                        if (img.cols != 100 || img.rows != 100) {
-                            cv::resize(img, img, cv::Size(100, 100));
-                        }
-                        images.push_back(img);
-                        labels.push_back(labelId);
-                    }
-                }
-                labelToName[labelId] = person;
-                labelId++;
-            }
-
-            if (images.empty()) {
-                QMetaObject::invokeMethod(this, [this]() {
-                    QMessageBox::warning(this, "错误", "没有找到有效的训练图片！");
-                    m_trainModelBtn->setEnabled(true);
-                    m_trainStartBtn->setEnabled(true);
-                });
-                return;
-            }
-
-            auto recognizer = cv::face::LBPHFaceRecognizer::create();
-            recognizer->train(images, labels);
-
-            QDir().mkpath("data/models");
-            recognizer->write("data/models/face_model.yml");
-
-            QFile mappingFile("data/models/label_mapping.txt");
-            if (mappingFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-                QTextStream out(&mappingFile);
-                for (const auto &pair : labelToName) {
-                    out << pair.first << "=" << pair.second << "\n";
-                }
-                mappingFile.close();
-            }
-
-            int personCount = labelToName.size();
-            QMetaObject::invokeMethod(this, [this, personCount]() {
-                m_trainStatusLabel->setText(QString("✅ 训练完成！共训练 %1 人").arg(personCount));
-                m_trainStatusLabel->setStyleSheet("color: #27ae60;");
-                m_trainModelBtn->setEnabled(true);
-                m_trainStartBtn->setEnabled(true);
-                QMessageBox::information(this, "成功", QString("模型训练完成！\n共训练 %1 人").arg(personCount));
-            });
-
-        } catch (const std::exception &e) {
-            QString errorMsg = QString::fromStdString(e.what());
-            QMetaObject::invokeMethod(this, [this, errorMsg]() {
-                QMessageBox::critical(this, "错误", QString("训练失败：%1").arg(errorMsg));
-                m_trainModelBtn->setEnabled(true);
-                m_trainStartBtn->setEnabled(true);
-                m_trainStatusLabel->setText("训练失败");
-            });
-        }
-    });
-}
-
-void MainWindow::initCamera()
-{
-    LOG_INFO("Starting camera thread...");
-    m_cameraThread = new CameraThread(this);
-    connect(m_cameraThread, &CameraThread::frameReady, this, &MainWindow::onFrameReady);
-    connect(m_cameraThread, &CameraThread::error, this, &MainWindow::onCameraError);
-    connect(m_cameraThread, &CameraThread::faceDetected, this, &MainWindow::onFaceDetected);
-    connect(m_cameraThread, &CameraThread::faceRecognized, this, &MainWindow::onFaceRecognized);
-    connect(m_cameraThread, &CameraThread::unknownFaceAlert, this, &MainWindow::onAlertTriggered);
-    m_cameraThread->start();
-}
-
 void MainWindow::onFaceRecognized(const QString &name)
 {
     LOG_INFO(QString("Face recognized: %1, unlocking door!").arg(name));
@@ -777,12 +622,7 @@ void MainWindow::onFaceDetected(int x, int y, int width, int height)
 void MainWindow::onCameraError(const QString &msg)
 {
     LOG_ERROR(QString("Camera error: %1").arg(msg));
-    if (m_cameraLabel) {
-        m_cameraLabel->setText("摄像头打开失败！\n" + msg);
-    }
-    if (m_trainCameraLabel) {
-        m_trainCameraLabel->setText("摄像头打开失败！\n" + msg);
-    }
+    statusBar()->showMessage("摄像头错误: " + msg, 3000);
 }
 
 void MainWindow::initRC522()
@@ -918,33 +758,39 @@ void MainWindow::updateLockStatus(bool locked)
 
 void MainWindow::onFaceRecognitionClicked()
 {
-    m_stackedWidget->setCurrentIndex(0);
+    m_stackedWidget->setCurrentIndex(PAGE_FACE_RECOGNITION);
     LOG_DEBUG("Switch to face recognition page");
 }
 
 void MainWindow::onPasswordInputClicked()
 {
-    m_stackedWidget->setCurrentIndex(1);
+    m_stackedWidget->setCurrentIndex(PAGE_PASSWORD_INPUT);
     LOG_DEBUG("Switch to password input page");
 }
 
 void MainWindow::onChangePasswordClicked()
 {
-    m_stackedWidget->setCurrentIndex(2);
+    m_stackedWidget->setCurrentIndex(PAGE_PASSWORD_CHANGE);
     LOG_DEBUG("Switch to change password page");
 }
 
 void MainWindow::onFaceTrainClicked()
 {
-    m_stackedWidget->setCurrentIndex(3);
-    loadPersonList();
+    m_stackedWidget->setCurrentIndex(PAGE_FACE_TRAIN);
     LOG_DEBUG("Switch to face train page");
 }
 
 void MainWindow::onManualUnlockClicked()
 {
-    m_stackedWidget->setCurrentIndex(4);
+    m_stackedWidget->setCurrentIndex(PAGE_MANUAL_CONTROL);
     LOG_DEBUG("Switch to manual control page");
+}
+
+void MainWindow::onAccessLogClicked()
+{
+    m_stackedWidget->setCurrentIndex(PAGE_ACCESS_LOG);
+    refreshLogTable();
+    LOG_DEBUG("Switch to access log page");
 }
 
 void MainWindow::onRemoteUnlockRequested()

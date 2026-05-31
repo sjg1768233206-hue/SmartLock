@@ -219,3 +219,4 @@ bool DatabaseManager::resolveAlert(int alertId)
         return false;
     }
 }
+

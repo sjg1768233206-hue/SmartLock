@@ -4,18 +4,20 @@
 #include "logger.h"
 #include <QDebug>
 #include <QFile>
-#include <QTextStream>
 #include <QDir>
+#include <QDateTime>
 #include <QMetaObject>
-#include <QtCore>
+#include <QCoreApplication>
 
 CameraThread::CameraThread(QObject *parent)
     : QThread(parent)
     , m_running(false)
     , m_faceDetectionEnabled(true)
-    , m_recognizerLoaded(false)
+    , m_recognizerInitialized(false)
+    , m_dbLoaded(false)
     , m_unknownFaceCount(0)
 {
+    m_lastUnlockTime = QTime::currentTime().addSecs(-3);
 }
 
 CameraThread::~CameraThread()
@@ -29,15 +31,12 @@ void CameraThread::stop()
     m_running = false;
 }
 
-void CameraThread::setFaceDetectionEnabled(bool enabled)
-{
-    m_faceDetectionEnabled = enabled;
-}
 
 bool CameraThread::initFaceDetection()
 {
     LOG_INFO("Initializing face detection...");
 
+    // 初始化 OpenCV 人脸检测器
     QString cascadePath = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml";
 
     if (!QFile::exists(cascadePath)) {
@@ -46,95 +45,56 @@ bool CameraThread::initFaceDetection()
         return false;
     }
 
-    LOG_DEBUG(QString("Loading cascade from: %1").arg(cascadePath));
-
     if (!m_faceCascade.load(cascadePath.toStdString())) {
         LOG_ERROR("Failed to load face cascade!");
         m_faceDetectionEnabled = false;
         return false;
     }
 
-    LOG_INFO("Face detection initialized successfully");
+    LOG_INFO("OpenCV face detection initialized");
+
+    // 初始化 NPU 识别器 (MobileFaceNet)
+    QString recogPath = "/home/cat/smartlock/model/mobilefacenet.rknn";
+    if (QFile::exists(recogPath) && m_recognizer.init(recogPath.toStdString())) {
+        LOG_INFO("MobileFaceNet recognizer initialized");
+        m_recognizerInitialized = true;
+    } else {
+        LOG_WARNING("Recognizer not available");
+    }
+
+    // 加载特征数据库
+    QString dbPath = "/opt/smartlock/bin/data/features.db";
+    if (FeatureDatabase::instance().load()) {
+        m_dbLoaded = true;
+        LOG_INFO(QString("Loaded %1 users from database").arg(FeatureDatabase::instance().getAllUserNames().size()));
+    } else {
+        LOG_WARNING("No feature database found");
+        FeatureDatabase::instance().setThreshold(0.4f);
+    }
+
+    m_faceDetectionEnabled = true;
     return true;
 }
 
-bool CameraThread::loadRecognizer()
+std::vector<float> CameraThread::extractFeatureForEnroll(const cv::Mat& face)
 {
-    LOG_INFO("Loading face recognizer...");
-
-    QFile modelFile("data/models/face_model.yml");
-    if (!modelFile.exists()) {
-        LOG_WARNING("No face model found, please train first");
-        return false;
+    if (!m_recognizerInitialized || face.empty()) {
+        return std::vector<float>();
     }
-
-    m_recognizer = cv::face::LBPHFaceRecognizer::create();
-
-    try {
-        m_recognizer->read("data/models/face_model.yml");
-        LOG_INFO("Face model loaded successfully");
-    } catch (const cv::Exception &e) {
-        LOG_ERROR(QString("Failed to load face model: %1").arg(e.what()));
-        return false;
-    }
-
-    m_labelToName.clear();
-    QFile mappingFile("data/models/label_mapping.txt");
-    if (mappingFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QTextStream in(&mappingFile);
-        while (!in.atEnd()) {
-            QString line = in.readLine();
-            QStringList parts = line.split("=");
-            if (parts.size() == 2) {
-                m_labelToName[parts[0].toInt()] = parts[1];
-                LOG_DEBUG(QString("Loaded label: %1 = %2").arg(parts[0]).arg(parts[1]));
-            }
-        }
-        mappingFile.close();
-    }
-
-    LOG_INFO(QString("Recognizer ready, known faces: %1").arg(m_labelToName.size()));
-    return !m_labelToName.empty();
-}
-
-int CameraThread::recognizeFace(const cv::Mat &faceROI)
-{
-    if (!m_recognizer || faceROI.empty()) {
-        return -1;
-    }
-
-    cv::Mat resized;
-    cv::resize(faceROI, resized, cv::Size(100, 100));
-
-    int label = -1;
-    double confidence = 0.0;
-
-    try {
-        m_recognizer->predict(resized, label, confidence);
-
-        if (confidence < 80.0 && label >= 0) {
-            LOG_DEBUG(QString("Recognized: label=%1, confidence=%2").arg(label).arg(confidence));
-            return label;
-        } else {
-            LOG_DEBUG(QString("Unknown face, confidence=%1").arg(confidence));
-        }
-    } catch (const cv::Exception &e) {
-        LOG_ERROR(QString("Recognition error: %1").arg(e.what()));
-    }
-
-    return -1;
+    return m_recognizer.extractFeature(face);
 }
 
 void CameraThread::detectAndDrawFaces(cv::Mat &frame)
 {
-    if (!m_faceDetectionEnabled || m_faceCascade.empty()) {
+    if (!m_faceDetectionEnabled) {
         return;
     }
 
-    if (!m_recognizerLoaded) {
-        m_recognizerLoaded = loadRecognizer();
+    if (m_faceCascade.empty()) {
+        return;
     }
 
+    // 1. OpenCV 人脸检测
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_RGB2GRAY);
     cv::equalizeHist(gray, gray);
@@ -142,55 +102,59 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
     std::vector<cv::Rect> faces;
     m_faceCascade.detectMultiScale(gray, faces, 1.1, 3, 0, cv::Size(60, 60));
 
+    LOG_DEBUG(QString("OpenCV detected %1 faces").arg(faces.size()));
+
     bool hasRecognizedFace = false;
 
     for (const auto& face : faces) {
+        // 绘制绿色边框
         cv::rectangle(frame, face, cv::Scalar(0, 255, 0), 2);
 
         QString displayName = "Unknown";
         cv::Scalar textColor = cv::Scalar(0, 0, 255);
 
-        if (m_recognizerLoaded) {
-            cv::Mat faceROI = gray(face);
-            int label = recognizeFace(faceROI);
+        // 2. NPU 识别
+        if (m_recognizerInitialized && face.width > 60 && face.height > 60) {
+            cv::Mat faceROI = frame(face);
+            std::vector<float> features = m_recognizer.extractFeature(faceROI);
 
-            if (label >= 0 && m_labelToName.count(label)) {
-                displayName = m_labelToName[label];
-                textColor = cv::Scalar(0, 255, 0);
-                hasRecognizedFace = true;
+            if (!features.empty()) {
+                float bestScore = 0.0f;
+                QString name = FeatureDatabase::instance().recognize(features, bestScore);
 
-                LOG_INFO(QString("Recognized as: %1").arg(displayName));
+                if (!name.isEmpty() && bestScore > FeatureDatabase::instance().getThreshold()) {
+                    displayName = name;
+                    textColor = cv::Scalar(0, 255, 0);
+                    hasRecognizedFace = true;
 
-                int elapsed = m_lastUnlockTime.msecsTo(QTime::currentTime());
-                if (elapsed > 3000) {
-                    m_lastUnlockedPerson = displayName;
-                    m_lastUnlockTime = QTime::currentTime();
+                    LOG_INFO(QString("Recognized: %1, score=%2").arg(name).arg(bestScore));
 
-                    LOG_INFO(QString("Unlocking and logging for: %1").arg(displayName));
+                    // 开锁防抖（3秒内只开锁一次）
+                    int elapsed = m_lastUnlockTime.msecsTo(QTime::currentTime());
+                    if (elapsed > 3000) {
+                        m_lastUnlockTime = QTime::currentTime();
 
-                    QString nameCopy = displayName;
-                    QMetaObject::invokeMethod(qApp, [nameCopy]() {
-                        DatabaseManager::instance().addLog(nameCopy, "人脸", true);
-                        LockController::instance().unlock();
-                    }, Qt::QueuedConnection);
+                        QString nameCopy = name;
+                        QMetaObject::invokeMethod(qApp, [nameCopy]() {
+                            DatabaseManager::instance().addLog(nameCopy, "人脸", true);
+                            LockController::instance().unlock();
+                        }, Qt::QueuedConnection);
 
-                    emit faceRecognized(displayName);
-                } else {
-                    LOG_DEBUG(QString("Skip unlock, only %1 ms since last unlock").arg(elapsed));
+                        emit faceRecognized(name);
+                    }
                 }
-            } else {
-                LOG_DEBUG(QString("Unknown face, label=%1").arg(label));
             }
         }
 
+        // 绘制姓名标签
         cv::putText(frame, displayName.toStdString(),
                     cv::Point(face.x, face.y - 10),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, textColor, 2);
 
+        // 保存人脸图像（用于注册）
         if (face.width > 60 && face.height > 60) {
-            cv::Mat faceROI = frame(face);
             cv::Mat grayFace;
-            cv::cvtColor(faceROI, grayFace, cv::COLOR_RGB2GRAY);
+            cv::cvtColor(frame(face), grayFace, cv::COLOR_RGB2GRAY);
             {
                 QMutexLocker locker(&m_faceMutex);
                 m_currentFace = grayFace;
@@ -200,9 +164,9 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
         emit faceDetected(face.x, face.y, face.width, face.height);
     }
 
+    // 陌生人报警逻辑
     if (hasRecognizedFace) {
         m_unknownFaceCount = 0;
-        LOG_DEBUG("Recognized face, reset unknown counter");
     } else if (!faces.empty()) {
         m_unknownFaceCount++;
         LOG_DEBUG(QString("Unknown face count: %1").arg(m_unknownFaceCount));
@@ -230,6 +194,7 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
         }
     }
 
+    // 显示人脸数量
     if (!faces.empty()) {
         std::string text = "Faces: " + std::to_string(faces.size());
         cv::putText(frame, text, cv::Point(10, 30),
@@ -240,9 +205,9 @@ void CameraThread::detectAndDrawFaces(cv::Mat &frame)
 void CameraThread::run()
 {
     LOG_INFO("CameraThread started");
-
     m_running = true;
 
+    // 打开摄像头
     if (!m_cap.open(0, cv::CAP_V4L2)) {
         LOG_ERROR("Failed to open camera");
         emit error("摄像头打开失败！");
@@ -250,11 +215,11 @@ void CameraThread::run()
     }
 
     LOG_INFO("Camera opened successfully");
-
     m_cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
     m_cap.set(cv::CAP_PROP_FPS, 15);
 
+    // 摄像头参数优化
     system("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 2>/dev/null");
     system("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_absolute=650 2>/dev/null");
     system("v4l2-ctl -d /dev/video0 --set-ctrl=gain=65 2>/dev/null");
@@ -267,51 +232,46 @@ void CameraThread::run()
 
     msleep(100);
 
+    // 初始化人脸检测
     initFaceDetection();
 
-    cv::Mat frame;
-    cv::Mat displayFrame;
+    cv::Mat frame, displayFrame;
     int frameCount = 0;
 
     while (m_running) {
         m_cap >> frame;
-
         if (frame.empty()) {
             msleep(10);
             continue;
         }
 
-        if (frame.channels() == 3) {
-            cv::cvtColor(frame, displayFrame, cv::COLOR_BGR2RGB);
-        } else {
-            displayFrame = frame;
-        }
+        // BGR → RGB
+        cv::cvtColor(frame, displayFrame, cv::COLOR_BGR2RGB);
 
+        // 保存当前帧
         if (!displayFrame.empty()) {
             QImage qimg(displayFrame.data, displayFrame.cols, displayFrame.rows,
                         displayFrame.step, QImage::Format_RGB888);
             {
                 QMutexLocker locker(&m_frameMutex);
                 m_currentFrame = qimg.copy();
-                static int frameSaveCount = 0;
-                if (++frameSaveCount % 30 == 0) {
-                    LOG_DEBUG(QString("Frame saved, size: %1x%2").arg(m_currentFrame.width()).arg(m_currentFrame.height()));
-                }
             }
         }
 
+        // 人脸检测（每3帧检测一次，降低负载）
         frameCount++;
         if (frameCount % 3 == 0) {
             detectAndDrawFaces(displayFrame);
         }
 
+        // 发送到 UI
         if (!displayFrame.empty()) {
             QImage qimg(displayFrame.data, displayFrame.cols, displayFrame.rows,
                         displayFrame.step, QImage::Format_RGB888);
             emit frameReady(qimg.copy());
         }
 
-        msleep(66);
+        msleep(66);  // 约15fps
     }
 
     m_cap.release();
@@ -321,12 +281,14 @@ void CameraThread::run()
 QImage CameraThread::getCurrentFrame()
 {
     QMutexLocker locker(&m_frameMutex);
-    static int callCount = 0;
-    if (++callCount % 30 == 0) {
-        LOG_DEBUG(QString("getCurrentFrame called, frame null: %1").arg(m_currentFrame.isNull()));
-    }
     if (m_currentFrame.isNull()) {
         return QImage();
     }
     return m_currentFrame.copy();
+}
+
+cv::Mat CameraThread::getCurrentFace()
+{
+    QMutexLocker locker(&m_faceMutex);
+    return m_currentFace.clone();
 }

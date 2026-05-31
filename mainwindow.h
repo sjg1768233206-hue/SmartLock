@@ -6,7 +6,6 @@
 #include <QLabel>
 #include <QStackedWidget>
 #include <QPushButton>
-#include <QComboBox>
 #include <QLineEdit>
 #include <QTableView>
 #include <opencv2/opencv.hpp>
@@ -18,7 +17,8 @@ QT_END_NAMESPACE
 class PasswordWidget;
 class CameraThread;
 class RC522Thread;
-class HttpServer;
+class GPUVideoWidget;
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -37,28 +37,28 @@ private slots:
     void onFaceDetected(int x, int y, int width, int height);
     void onFaceRecognized(const QString &name);
 
-    // 页面切换槽函数
+    // 页面切换
     void onFaceRecognitionClicked();
     void onPasswordInputClicked();
     void onChangePasswordClicked();
     void onFaceTrainClicked();
     void onManualUnlockClicked();
+    void onAccessLogClicked();
 
-    // 训练相关槽函数
-    void loadPersonList();
-    void onStartCapture();
-    void onSaveFace();
-    void onTrainModel();
+    // 人脸管理
+    void onCapturePhoto();
+    void onConfirmEnroll();
+    void onCancelEnroll();
+    void onShowPersonList();
 
-    // 数据库相关槽函数
+    // 数据库
     void refreshLogTable();
     void refreshTodayLogTable();
-    // websocket
+
     void onRemoteUnlockRequested();
     void onRemoteLockRequested();
     void onRemoteStatusRequested();
-
-    void onAlertTriggered(QString photoPath);  // 添加这行
+    void onAlertTriggered(QString photoPath);
 
 private:
     void setupUI();
@@ -67,50 +67,44 @@ private:
     void initRC522();
     void initDatabase();
     void initWebSocket();
+    void initHttpServer();
 
     float readTemperature();
     float readHumidity();
 
-    void initHttpServer();  // 添加这行
 private:
     Ui::MainWindow *ui;
 
     QStackedWidget *m_stackedWidget;
     PasswordWidget *m_passwordWidget;
-
-    // 摄像头显示标签
-    QLabel *m_cameraLabel;           // 人脸识别页面用
-    QLabel *m_trainCameraLabel;      // 人脸训练页面用
+    GPUVideoWidget *m_cameraLabel;
+    GPUVideoWidget *m_trainCameraLabel;
 
     QLabel *m_lockStatusLabel;
     QLabel *m_tempLabel;
     QLabel *m_humiLabel;
 
-    // 多线程相关
+    // 多线程
     CameraThread *m_cameraThread;
     RC522Thread *m_rc522Thread;
 
-    // AHT20 I2C
+    // AHT20
     int m_i2c_fd;
     QTimer *m_tempTimer;
 
-    // 人脸训练相关
+    // 人脸管理
     QLineEdit *m_trainNameEdit;
-    QComboBox *m_trainPersonList;
-    QPushButton *m_trainStartBtn;
-    QPushButton *m_trainModelBtn;
-    QLabel *m_trainProgressLabel;
     QLabel *m_trainStatusLabel;
+    QPushButton *m_btnConfirm;
+    QPushButton *m_btnCancel;
+    QString m_tempFacePath;
 
-    // 数据库相关
+    // 开门记录
     QTableView *m_logTableView;
     QLabel *m_todayCountLabel;
 
-    int m_captureCount;
-    QString m_currentPerson;
-    bool m_isCapturing;
-
-    HttpServer *m_httpServer;
+    // HTTP 服务器
+    class HttpServer *m_httpServer;
 };
 
 #endif // MAINWINDOW_H
