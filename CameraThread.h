@@ -6,7 +6,7 @@
 #include <QMutex>
 #include <QTime>
 #include <opencv2/opencv.hpp>
-#include <opencv2/objdetect.hpp>
+#include "RetinaFaceEngine.h"
 #include "FaceRecognizer.h"
 #include "FeatureDatabase.h"
 
@@ -46,7 +46,7 @@ private:
     QTime m_lastUnlockTime;
 
     cv::VideoCapture m_cap;
-    cv::CascadeClassifier m_faceCascade;
+    RetinaFaceEngine m_retinaFace;
     FaceRecognizer m_recognizer;
 
     QImage m_currentFrame;

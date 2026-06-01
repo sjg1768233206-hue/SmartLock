@@ -36,7 +36,8 @@ HEADERS += \
     logger.h \
     mainwindow.h \
     passwordmanager.h \
-    passwordwidget.h
+    passwordwidget.h \
+    rknn_box_priors.h
 
 FORMS += \
     mainwindow.ui
@@ -102,7 +103,9 @@ LIBS += -lopencv_core \
         -lopencv_videoio \
         -lopencv_highgui \
         -lopencv_imgcodecs \
-        -lopencv_face
+        -lopencv_face \
+        -lopencv_calib3d \
+        -lopencv_imgcodecs
 
 LIBS += -L/usr/lib -lrknnrt
 INCLUDEPATH += /usr/include/rknpu2

@@ -1,17 +1,16 @@
 #include "RetinaFaceEngine.h"
 #include "logger.h"
 #include <algorithm>
-#include <cmath>
 #include <cstring>
-#include <cstdio>
-#include <vector>
+#include <cmath>
+#include "rknn_box_priors.h"
 
 RetinaFaceEngine::RetinaFaceEngine()
-    : m_ctx(0)
-    , m_inputWidth(320)
-    , m_inputHeight(320)
-    , m_initialized(false)
 {
+    m_ctx = 0;
+    m_inputW = 320;
+    m_inputH = 320;
+    m_init = false;
 }
 
 RetinaFaceEngine::~RetinaFaceEngine()
@@ -19,384 +18,259 @@ RetinaFaceEngine::~RetinaFaceEngine()
     release();
 }
 
-bool RetinaFaceEngine::init(const std::string& modelPath, int inputWidth, int inputHeight)
+// ================= INIT =================
+bool RetinaFaceEngine::init(const std::string& modelPath, int inputW, int inputH)
 {
-    m_inputWidth = inputWidth;
-    m_inputHeight = inputHeight;
+    m_inputW = inputW;
+    m_inputH = inputH;
 
-    LOG_INFO(QString("Loading RetinaFace model from: %1").arg(modelPath.c_str()));
-
-    // 1. 打开模型文件
     FILE* fp = fopen(modelPath.c_str(), "rb");
-    if (!fp) {
-        LOG_ERROR(QString("Model file not found: %1").arg(modelPath.c_str()));
-        return false;
-    }
+    if (!fp) return false;
 
-    // 2. 获取文件大小
     fseek(fp, 0, SEEK_END);
-    size_t modelSize = ftell(fp);
+    size_t size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    // 3. 读取模型数据
-    unsigned char* modelData = new unsigned char[modelSize];
-    if (fread(modelData, 1, modelSize, fp) != modelSize) {
-        LOG_ERROR("Failed to read model file");
-        delete[] modelData;
-        fclose(fp);
-        return false;
-    }
+    unsigned char* model = new unsigned char[size];
+    fread(model, 1, size, fp);
     fclose(fp);
 
-    // 4. 初始化RKNN
-    int ret = rknn_init(&m_ctx, (void*)modelData, modelSize, 0, nullptr);
-    delete[] modelData;
+    int ret = rknn_init(&m_ctx, model, size, 0, nullptr);
+    delete[] model;
 
-    if (ret < 0) {
-        LOG_ERROR(QString("rknn_init failed: %1").arg(ret));
-        return false;
-    }
+    if (ret < 0) return false;
 
-    // 5. 查询输入输出信息
-    rknn_input_output_num io_num;
-    memset(&io_num, 0, sizeof(io_num));
-    ret = rknn_query(m_ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
-    if (ret < 0) {
-        LOG_ERROR("rknn_query IO_NUM failed");
-        return false;
-    }
-
-    LOG_INFO(QString("Model inputs: %1, outputs: %2").arg(io_num.n_input).arg(io_num.n_output));
-
-    // 6. 查询输入维度
-    rknn_tensor_attr input_attrs[io_num.n_input];
-    memset(input_attrs, 0, sizeof(input_attrs));
-    for (uint32_t i = 0; i < io_num.n_input; i++) {
-        input_attrs[i].index = i;
-        ret = rknn_query(m_ctx, RKNN_QUERY_INPUT_ATTR, &(input_attrs[i]), sizeof(rknn_tensor_attr));
-        if (ret < 0) {
-            LOG_ERROR("rknn_query INPUT_ATTR failed");
-            return false;
-        }
-        LOG_INFO(QString("Input %1 shape: %2x%3x%4x%5")
-                    .arg(i)
-                    .arg(input_attrs[i].dims[0])
-                    .arg(input_attrs[i].dims[1])
-                    .arg(input_attrs[i].dims[2])
-                    .arg(input_attrs[i].dims[3]));
-    }
-
-    // 7. 查询输出维度
-    for (uint32_t i = 0; i < io_num.n_output; i++) {
-        rknn_tensor_attr attr;
-        attr.index = i;
-        rknn_query(m_ctx, RKNN_QUERY_OUTPUT_ATTR, &attr, sizeof(attr));
-        LOG_INFO(QString("Output %1 dims: [%2,%3,%4,%5], elems: %6")
-                    .arg(i)
-                    .arg(attr.dims[0])
-                    .arg(attr.dims[1])
-                    .arg(attr.dims[2])
-                    .arg(attr.dims[3])
-                    .arg(attr.n_elems));
-    }
-
-    m_initialized = true;
-    LOG_INFO("RetinaFace engine initialized successfully");
+    LOG_INFO("RetinaFace model loaded successfully");
+    m_init = true;
     return true;
 }
 
-cv::Mat RetinaFaceEngine::preprocess(const cv::Mat& src, float& scaleX, float& scaleY)
+// ================= PREPROCESS =================
+PreprocessInfo RetinaFaceEngine::preprocess(const cv::Mat& img)
 {
-    int srcWidth = src.cols;
-    int srcHeight = src.rows;
+    PreprocessInfo info;
+    int w = m_inputW;
+    int h = m_inputH;
 
-    scaleX = (float)m_inputWidth / srcWidth;
-    scaleY = (float)m_inputHeight / srcHeight;
+    cv::Mat rgb;
+    cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
 
-    // 1. 缩放到模型输入尺寸
+    info.scale = std::min((float)w / img.cols, (float)h / img.rows);
+    int nw = img.cols * info.scale;
+    int nh = img.rows * info.scale;
+
     cv::Mat resized;
-    cv::resize(src, resized, cv::Size(m_inputWidth, m_inputHeight));
+    cv::resize(rgb, resized, cv::Size(nw, nh));
 
-    // 2. 转换为 float32
-    cv::Mat floatImg;
-    resized.convertTo(floatImg, CV_32FC3);
+    info.canvas = cv::Mat(h, w, CV_8UC3, cv::Scalar(114, 114, 114));
+    info.offset_x = (w - nw) / 2;
+    info.offset_y = (h - nh) / 2;
+    resized.copyTo(info.canvas(cv::Rect(info.offset_x, info.offset_y, nw, nh)));
 
-    // 3. RetinaFace 预处理：减去均值 (BGR 顺序的均值)
-    // 注意：输入是 RGB 格式，但模型是用 BGR 训练的，所以这里用 BGR 均值
-    std::vector<float> mean_vals = {104.0f, 117.0f, 123.0f};  // BGR 均值
-
-    std::vector<cv::Mat> channels(3);
-    cv::split(floatImg, channels);
-
-    // channels[0] = R, channels[1] = G, channels[2] = B
-    // 减去均值时需要对应正确的通道
-    // 模型期望 BGR，所以 channels[2] 减 104, channels[1] 减 117, channels[0] 减 123
-    channels[0] = channels[0] - mean_vals[2];  // R - 123
-    channels[1] = channels[1] - mean_vals[1];  // G - 117
-    channels[2] = channels[2] - mean_vals[0];  // B - 104
-
-    cv::merge(channels, floatImg);
-
-    // 4. 使用 NHWC 格式
-    cv::Mat nhwc(1, m_inputHeight * m_inputWidth * 3, CV_32FC1);
-    memcpy(nhwc.data, floatImg.data, m_inputHeight * m_inputWidth * 3 * sizeof(float));
-
-    return nhwc;
+    return info;
 }
 
-std::vector<FaceInfo> RetinaFaceEngine::detect(const cv::Mat& image)
+// ================= DETECT =================
+std::vector<FaceInfo> RetinaFaceEngine::detect(const cv::Mat& img)
 {
-    std::vector<FaceInfo> results;
+    std::vector<FaceInfo> out;
+    if (!m_init || img.empty()) return out;
 
-    if (!m_initialized || image.empty()) {
-        LOG_WARNING("detect: not initialized or empty image");
-        return results;
-    }
+    PreprocessInfo preInfo = preprocess(img);
 
-    // 1. 预处理
-    float scaleX, scaleY;
-    cv::Mat inputBlob = preprocess(image, scaleX, scaleY);
+    rknn_input in[1]{};
+    in[0].index = 0;
+    in[0].type = RKNN_TENSOR_UINT8;
+    in[0].fmt = RKNN_TENSOR_NHWC;
+    in[0].size = m_inputW * m_inputH * 3;
+    in[0].buf = preInfo.canvas.data;
 
-    if (inputBlob.empty() || inputBlob.data == nullptr) {
-        LOG_ERROR("detect: inputBlob is empty");
-        return results;
-    }
+    rknn_inputs_set(m_ctx, 1, in);
+    rknn_run(m_ctx, nullptr);
 
-    // 2. 设置输入
-    rknn_input inputs[1];
-    memset(inputs, 0, sizeof(inputs));
-    inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_FLOAT32;
-    inputs[0].size = m_inputWidth * m_inputHeight * 3 * sizeof(float);
-    inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].buf = inputBlob.data;
+    rknn_input_output_num io{};
+    rknn_query(m_ctx, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io));
 
-    int ret = rknn_inputs_set(m_ctx, 1, inputs);
-    if (ret < 0) {
-        LOG_ERROR("rknn_inputs_set failed");
-        return results;
-    }
+    std::vector<rknn_output> outs(io.n_output);
+    for (auto &o : outs) o.want_float = 1;
 
-    // 3. 推理
-    ret = rknn_run(m_ctx, nullptr);
-    if (ret < 0) {
-        LOG_ERROR("rknn_run failed");
-        return results;
-    }
+    if (rknn_outputs_get(m_ctx, io.n_output, outs.data(), nullptr) < 0)
+        return out;
 
-    // 4. 获取输出数量
-    rknn_input_output_num io_num;
-    memset(&io_num, 0, sizeof(io_num));
-    rknn_query(m_ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+    std::vector<float*> ptr;
+    for (auto &o : outs)
+        ptr.push_back((float*)o.buf);
 
-    // 5. 分配输出
-    std::vector<rknn_output> outputs(io_num.n_output);
-    for (uint32_t i = 0; i < io_num.n_output; i++) {
-        outputs[i].want_float = 1;
-        outputs[i].is_prealloc = 0;
-    }
+    out = postprocess(ptr.data(), io.n_output, img.cols, img.rows,
+                      preInfo.scale, preInfo.offset_x, preInfo.offset_y);
 
-    ret = rknn_outputs_get(m_ctx, io_num.n_output, outputs.data(), nullptr);
-    if (ret < 0) {
-        LOG_ERROR("rknn_outputs_get failed");
-        return results;
-    }
-
-    // 6. 收集输出指针
-    std::vector<float*> outputPtrs;
-    for (uint32_t i = 0; i < io_num.n_output; i++) {
-        outputPtrs.push_back((float*)outputs[i].buf);
-    }
-
-    // 7. 后处理
-    results = postprocess(outputPtrs.data(), io_num.n_output,
-                          image.cols, image.rows, scaleX, scaleY);
-
-    // 8. 释放输出
-    rknn_outputs_release(m_ctx, io_num.n_output, outputs.data());
-
-    return results;
+    rknn_outputs_release(m_ctx, io.n_output, outs.data());
+    return out;
 }
 
-std::vector<FaceInfo> RetinaFaceEngine::postprocess(float* outputs[], int outputCount,
-                                                     int imgWidth, int imgHeight,
-                                                     float scaleX, float scaleY)
+// ================= POSTPROCESS =================
+std::vector<FaceInfo> RetinaFaceEngine::postprocess(
+    float* outputs[],
+    int outputCount,
+    int imgW,
+    int imgH,
+    float scale,
+    int offset_x,
+    int offset_y)
 {
     std::vector<FaceInfo> faces;
+    if (outputCount < 3) return faces;
 
-    LOG_DEBUG(QString("=== Postprocess Debug ==="));
-    LOG_DEBUG(QString("outputCount=%1, imgSize=%2x%3").arg(outputCount).arg(imgWidth).arg(imgHeight));
+    float* loc = outputs[0];
+    float* conf = outputs[1];
+    float* landm = outputs[2];
 
-    if (outputCount < 3) {
-        LOG_WARNING(QString("Unexpected output count: %1, expected 3").arg(outputCount));
+    const float (*priors)[4] = nullptr;
+    int num = 0;
+
+    if (m_inputW == 320)
+    {
+        priors = BOX_PRIORS_320;
+        num = 4200;
+    }
+    else if (m_inputW == 640)
+    {
+        priors = BOX_PRIORS_640;
+        num = 16800;
+    }
+    else
+    {
         return faces;
     }
 
-    // 检查输出指针
-    for (int i = 0; i < outputCount; i++) {
-        if (outputs[i] == nullptr) {
-            LOG_ERROR(QString("Output %1 is null").arg(i));
-            return faces;
+    const float variances[2] = {0.1f, 0.2f};
+    const float CONFIDENCE_THRESHOLD = 0.2f;  // 可调整
+
+    for (int i = 0; i < num; i++)
+    {
+        float score = conf[i * 2 + 1];
+        if (score < CONFIDENCE_THRESHOLD) continue;
+
+        // 解码
+        float cx = priors[i][0];
+        float cy = priors[i][1];
+        float w = priors[i][2];
+        float h = priors[i][3];
+
+        float dx = loc[i * 4 + 0];
+        float dy = loc[i * 4 + 1];
+        float dw = loc[i * 4 + 2];
+        float dh = loc[i * 4 + 3];
+
+        cx += dx * variances[0] * w;
+        cy += dy * variances[0] * h;
+        w *= exp(dw * variances[1]);
+        h *= exp(dh * variances[1]);
+
+        float x1 = cx - w * 0.5f;
+        float y1 = cy - h * 0.5f;
+        float x2 = cx + w * 0.5f;
+        float y2 = cy + h * 0.5f;
+
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        // 坐标映射到原图
+        float real_x1 = (x1 * m_inputW - offset_x) / scale;
+        float real_y1 = (y1 * m_inputH - offset_y) / scale;
+        float real_x2 = (x2 * m_inputW - offset_x) / scale;
+        float real_y2 = (y2 * m_inputH - offset_y) / scale;
+
+        // 边界裁剪
+        real_x1 = std::max(0.0f, std::min((float)imgW, real_x1));
+        real_y1 = std::max(0.0f, std::min((float)imgH, real_y1));
+        real_x2 = std::max(0.0f, std::min((float)imgW, real_x2));
+        real_y2 = std::max(0.0f, std::min((float)imgH, real_y2));
+
+        if (real_x2 <= real_x1 || real_y2 <= real_y1) continue;
+
+        FaceInfo f;
+        f.score = score;
+        f.bbox = cv::Rect(
+            (int)real_x1,
+            (int)real_y1,
+            (int)(real_x2 - real_x1),
+            (int)(real_y2 - real_y1)
+        );
+
+        // 关键点映射
+        for (int k = 0; k < 5; k++)
+        {
+            float lx = landm[i * 10 + k * 2];
+            float ly = landm[i * 10 + k * 2 + 1];
+
+            lx = cx + lx * variances[0] * w;
+            ly = cy + ly * variances[0] * h;
+
+            float real_lx = (lx * m_inputW - offset_x) / scale;
+            float real_ly = (ly * m_inputH - offset_y) / scale;
+
+            real_lx = std::max(0.0f, std::min((float)imgW, real_lx));
+            real_ly = std::max(0.0f, std::min((float)imgH, real_ly));
+
+            f.landmarks.emplace_back(real_lx, real_ly);
         }
+
+        faces.push_back(f);
     }
 
-    int numAnchors = 4200;
-    int validFaces = 0;
-    float maxScore = 0.0f;
-
-    // 首先找出最大置信度
-    for (int i = 0; i < numAnchors; i++) {
-        int scoreIdx = i * 2 + 1;
-        float score = outputs[1][scoreIdx];
-        if (score > maxScore) {
-            maxScore = score;
-        }
-    }
-    LOG_DEBUG(QString("Max confidence score: %1").arg(maxScore, 0, 'f', 6));
-
-    // 动态调整阈值
-    float scoreThreshold = 0.3f;
-    if (maxScore > 0.8f) {
-        scoreThreshold = 0.5f;
-    } else if (maxScore > 0.5f) {
-        scoreThreshold = 0.4f;
-    }
-    LOG_DEBUG(QString("Using score threshold: %1").arg(scoreThreshold));
-
-    // 如果最大置信度太低，可能没有检测到人脸
-    if (maxScore < 0.1f) {
-        LOG_DEBUG("Max confidence too low, no faces detected");
-        return faces;
-    }
-
-    for (int i = 0; i < numAnchors; i++) {
-        // 置信度：outputs[1] 格式 [背景分数, 人脸分数]
-        int scoreIdx = i * 2 + 1;
-        float score = outputs[1][scoreIdx];
-
-        if (score > scoreThreshold) {
-            FaceInfo face;
-            face.score = score;
-
-            // 边界框坐标 (x1, y1, x2, y2)
-            int boxIdx = i * 4;
-            float x1 = outputs[0][boxIdx + 0];
-            float y1 = outputs[0][boxIdx + 1];
-            float x2 = outputs[0][boxIdx + 2];
-            float y2 = outputs[0][boxIdx + 3];
-
-            // 将坐标限制在 [0, 1] 范围
-            x1 = std::max(0.0f, std::min(1.0f, x1));
-            y1 = std::max(0.0f, std::min(1.0f, y1));
-            x2 = std::max(0.0f, std::min(1.0f, x2));
-            y2 = std::max(0.0f, std::min(1.0f, y2));
-
-            // 转换为像素坐标
-            int px1 = (int)(x1 * imgWidth);
-            int py1 = (int)(y1 * imgHeight);
-            int px2 = (int)(x2 * imgWidth);
-            int py2 = (int)(y2 * imgHeight);
-
-            // 确保坐标正确顺序
-            if (px1 > px2) std::swap(px1, px2);
-            if (py1 > py2) std::swap(py1, py2);
-
-            int x = px1;
-            int y = py1;
-            int width = px2 - px1;
-            int height = py2 - py1;
-
-            // 过滤太小或太大的框
-            if (width > 30 && height > 30 && width < imgWidth && height < imgHeight) {
-                face.bbox = cv::Rect(x, y, width, height);
-
-                // 解析关键点
-                int lmIdx = i * 10;
-                for (int k = 0; k < 5; k++) {
-                    float lx = outputs[2][lmIdx + k * 2];
-                    float ly = outputs[2][lmIdx + k * 2 + 1];
-                    lx = std::max(0.0f, std::min(1.0f, lx)) * imgWidth;
-                    ly = std::max(0.0f, std::min(1.0f, ly)) * imgHeight;
-                    face.landmarks.push_back(cv::Point2f(lx, ly));
-                }
-
-                faces.push_back(face);
-                validFaces++;
-
-                // 只记录前5个检测到的脸
-                if (validFaces <= 5) {
-                    LOG_DEBUG(QString("Face %1: score=%2, bbox=[%3,%4,%5,%6]")
-                              .arg(validFaces)
-                              .arg(score, 0, 'f', 4)
-                              .arg(x).arg(y).arg(width).arg(height));
-                }
-            }
-        }
-    }
-
-    LOG_DEBUG(QString("Found %1 valid faces before NMS").arg(validFaces));
-
-    // NMS 去重
-    if (!faces.empty()) {
+    if (!faces.empty())
         nms(faces, 0.4f);
-    }
-
-    LOG_DEBUG(QString("Final %1 faces after NMS").arg(faces.size()));
-    LOG_DEBUG(QString("=== Postprocess Debug End ==="));
 
     return faces;
 }
 
-float RetinaFaceEngine::calculateIou(const FaceInfo& a, const FaceInfo& b)
+// ================= IOU =================
+float RetinaFaceEngine::iou(const FaceInfo& a, const FaceInfo& b)
 {
     int x1 = std::max(a.bbox.x, b.bbox.x);
     int y1 = std::max(a.bbox.y, b.bbox.y);
     int x2 = std::min(a.bbox.x + a.bbox.width, b.bbox.x + b.bbox.width);
     int y2 = std::min(a.bbox.y + a.bbox.height, b.bbox.y + b.bbox.height);
 
-    int interArea = std::max(0, x2 - x1) * std::max(0, y2 - y1);
-    int areaA = a.bbox.width * a.bbox.height;
-    int areaB = b.bbox.width * b.bbox.height;
-
-    if (areaA + areaB - interArea <= 0) return 0;
-    return (float)interArea / (areaA + areaB - interArea);
+    int inter = std::max(0, x2 - x1) * std::max(0, y2 - y1);
+    int ua = a.bbox.area() + b.bbox.area() - inter;
+    return ua <= 0 ? 0 : (float)inter / ua;
 }
 
-void RetinaFaceEngine::nms(std::vector<FaceInfo>& faces, float threshold)
+// ================= NMS =================
+void RetinaFaceEngine::nms(std::vector<FaceInfo>& faces, float thr)
 {
-    if (faces.empty()) return;
-
     std::sort(faces.begin(), faces.end(),
-              [](const FaceInfo& a, const FaceInfo& b) { return a.score > b.score; });
+              [](auto& a, auto& b) { return a.score > b.score; });
 
-    std::vector<bool> keep(faces.size(), true);
+    std::vector<int> keep(faces.size(), 1);
 
-    for (size_t i = 0; i < faces.size(); i++) {
+    for (size_t i = 0; i < faces.size(); i++)
+    {
         if (!keep[i]) continue;
 
-        for (size_t j = i + 1; j < faces.size(); j++) {
+        for (size_t j = i + 1; j < faces.size(); j++)
+        {
             if (!keep[j]) continue;
 
-            if (calculateIou(faces[i], faces[j]) > threshold) {
-                keep[j] = false;
-            }
+            if (iou(faces[i], faces[j]) > thr)
+                keep[j] = 0;
         }
     }
 
-    std::vector<FaceInfo> filtered;
-    for (size_t i = 0; i < faces.size(); i++) {
-        if (keep[i]) {
-            filtered.push_back(faces[i]);
-        }
-    }
-    faces = filtered;
+    std::vector<FaceInfo> tmp;
+    for (size_t i = 0; i < faces.size(); i++)
+        if (keep[i]) tmp.push_back(faces[i]);
+
+    faces = tmp;
 }
 
+// ================= RELEASE =================
 void RetinaFaceEngine::release()
 {
     if (m_ctx) {
         rknn_destroy(m_ctx);
         m_ctx = 0;
     }
-    m_initialized = false;
+    m_init = false;
 }

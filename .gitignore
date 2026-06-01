@@ -1,43 +1,49 @@
-# Qt 编译产物
+# 编译产物
+build/
 *.o
-*.moc
-moc_*.cpp
+*.so
+*.a
 *.exe
 *.dll
-*.so
-*.dylib
 
-# Qt 临时文件
+# Qt 相关
 *.user
-*.user.*
-*.stash
+*.pro.user
 Makefile
-Makefile.*
+*.moc
+moc_*.cpp
 ui_*.h
-qrc_*.cpp
 
-# 编译目录
-build/
-*-Debug/
-*-Release/
+# 模型文件（太大）
+*.rknn
+*.onnx
+*.pb
+*.tflite
 
-# 开发板数据（不包含在代码仓库）
+# 数据文件
 data/
 logs/
 *.db
-*.log
-
-# IDE 配置
-.vscode/
-.idea/
-.qtcreator/
-*.swp
-*~
+*.db-journal
 
 # 备份文件
+*~
 *.bak
-*.old
+*.swp
+*.orig
 
-# 交叉编译产物
-smartlock
-smartlock.exe
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 临时文件
+temp/
+tmp/
+*.jpg
+*.png
+*.jpeg
+
+# 交叉编译相关
+sysroot_debian11/
+*.tar.gz

@@ -30,7 +30,7 @@ private:
     FeatureDatabase() = default;
 
     QVector<UserFeature> m_users;
-    float m_threshold = 0.6f;  // 相似度阈值
+    float m_threshold = 0.20f;  // 相似度阈值
 };
 
 #endif // FEATUREDATABASE_H
